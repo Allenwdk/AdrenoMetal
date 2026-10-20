@@ -13,6 +13,8 @@
 #include <algorithm>
 #include <atomic>
 #include <mutex>
+#include <pthread.h>
+#include <string>
 #include <unordered_map>
 #include <vector>
 #include <sys/mman.h>
@@ -70,6 +72,17 @@ static NSError *nbError(NSString *why) {
  return [NSError errorWithDomain:@"org.blu-sharky.native-metal" code:-1 userInfo:@{NSLocalizedDescriptionKey:why?:@"refused"}];
 }
 static NSString *lastError() {return [NSString stringWithUTF8String:nmb_last_error()];}
+// The render pipeline journal: one line per render pipeline creation (when, on which thread, how long, the outcome, both functions with
+// every constant value, the attachments, blending and vertex descriptor) appended to pipelines.log in the runtime's cache directory, which
+// the board log exports with the caches (CacheExport.h): every pipeline a boot made, or was refused, can be made again on the host.
+static std::mutex gJournalLock;
+static std::string gJournalPath;
+static uint64_t gJournalBegan;
+static void journal(const std::string &line) {
+ if(gJournalPath.empty())return;
+ std::lock_guard<std::mutex> lock(gJournalLock);
+ if(FILE *f=fopen(gJournalPath.c_str(),"a")){fwrite(line.data(),1,line.size(),f);fputc('\n',f);fclose(f);}
+}
 
 @interface NBObject : NSObject
 @property(atomic,copy) NSString *label;
@@ -280,6 +293,7 @@ static NBTexture *textureOnBuffer(NBBuffer *buffer,MTLTextureDescriptor *d,NSUIn
 @property(nonatomic) NmbFunction *handle;
 @property(nonatomic,copy) NSString *name;
 @property(nonatomic) MTLFunctionType functionType;
+@property(nonatomic) std::string constantsText;   // name:type:hex of each constant value it was specialized with (the journal's)
 @end
 @implementation NBFunction
 - (void)dealloc {nmb_function_release(_handle);}
@@ -337,11 +351,17 @@ static uint64_t constantBytes(uint64_t type) {
   if(!bytes || !v.data){if(error)*error=nbError([NSString stringWithFormat:@"constant type %lu is not qualified",(unsigned long)v.dataType]);return nil;}
   constants.push_back({v.dataType,group?0:v.index,group?v.name.UTF8String:nullptr,v.data,bytes});
  }
+ std::string text;
+ for(const NmbConstant &c:constants) {
+  char head[32];if(!c.name)snprintf(head,sizeof head,"#%llu",(unsigned long long)c.index);
+  text+=text.empty()?"":" ";text+=c.name?c.name:head;snprintf(head,sizeof head,":%llu:",(unsigned long long)c.type);text+=head;
+  for(uint64_t i=0;i<c.length;i++){snprintf(head,sizeof head,"%02x",((const uint8_t *)c.bytes)[i]);text+=head;}
+ }
  const uint64_t functionBegan=nowUs();
  NmbFunction *handle=nmb_function_new_specialized(_handle,name.UTF8String,constants.data(),(uint32_t)constants.size());gTimeFunction.add(functionBegan);
  if(!handle){if(error)*error=nbError([NSString stringWithFormat:@"specialized function: %@",lastError()]);return nil;}
  NBFunction *function=[NBFunction new];function.handle=handle;function.name=name;function.functionType=(MTLFunctionType)nmb_function_type(handle);
- if(error)*error=nil;return (id<MTLFunction>)function;
+ function.constantsText=text;if(error)*error=nil;return (id<MTLFunction>)function;
 }
 - (void)newFunctionWithName:(NSString *)name constantValues:(MTLFunctionConstantValues *)values completionHandler:(void (^)(id<MTLFunction>,NSError *))handler {
  NSError *error=nil;id<MTLFunction> function=[self newFunctionWithName:name constantValues:values error:&error];
@@ -953,6 +973,39 @@ template <typename T> static T failWith(NSError **error,NSString *what,T value) 
  if(error)*error=nbError([NSString stringWithFormat:@"%@: %@",what,lastError()]);
  return value;
 }
+// One journal line of a render pipeline creation begun at `began` (microseconds), `refused` its refusal or null. The label is the
+// caller's name for the pipeline (QuartzCore's: its spec's encoded name).
+static void journalRenderPipeline(MTLRenderPipelineDescriptor *d,uint64_t began,const char *refused) {
+ if(gJournalPath.empty())return;
+ const uint64_t ended=nowUs();uint64_t tid=0;pthread_threadid_np(nullptr,&tid);
+ char head[256];
+ snprintf(head,sizeof head,"R t=%llu tid=%llu main=%d us=%llu ok=%d samples=%lu topo=%lu ds=%lu/%lu",(unsigned long long)((began-gJournalBegan)/1000),
+     (unsigned long long)tid,pthread_main_np(),(unsigned long long)(ended-began),refused?0:1,(unsigned long)d.rasterSampleCount,
+     (unsigned long)d.inputPrimitiveTopology,(unsigned long)d.depthAttachmentPixelFormat,(unsigned long)d.stencilAttachmentPixelFormat);
+ std::string line=head;
+ line+=" label=";line+=d.label.length?d.label.UTF8String:"-";
+ for(unsigned i=0;i<8;i++) {
+  MTLRenderPipelineColorAttachmentDescriptor *a=d.colorAttachments[i];if(a.pixelFormat==MTLPixelFormatInvalid)continue;
+  snprintf(head,sizeof head," c%u=%lu:%lu:%d:%lu:%lu:%lu:%lu:%lu:%lu",i,(unsigned long)a.pixelFormat,(unsigned long)a.writeMask,(int)a.blendingEnabled,
+      (unsigned long)a.sourceRGBBlendFactor,(unsigned long)a.destinationRGBBlendFactor,(unsigned long)a.rgbBlendOperation,(unsigned long)a.sourceAlphaBlendFactor,
+      (unsigned long)a.destinationAlphaBlendFactor,(unsigned long)a.alphaBlendOperation);
+  line+=head;
+ }
+ if(MTLVertexDescriptor *v=d.vertexDescriptor)for(unsigned i=0;i<31;i++) {
+  MTLVertexAttributeDescriptor *a=v.attributes[i];if(a.format==MTLVertexFormatInvalid)continue;
+  MTLVertexBufferLayoutDescriptor *l=v.layouts[a.bufferIndex<31?a.bufferIndex:0];
+  snprintf(head,sizeof head," a%u=%lu:%lu:%lu:%lu:%lu:%lu",i,(unsigned long)a.format,(unsigned long)a.offset,(unsigned long)a.bufferIndex,(unsigned long)l.stride,
+      (unsigned long)l.stepFunction,(unsigned long)l.stepRate);
+  line+=head;
+ }
+ NBFunction *vf=[(id)d.vertexFunction isKindOfClass:[NBFunction class]]?(NBFunction *)d.vertexFunction:nil;
+ NBFunction *ff=[(id)d.fragmentFunction isKindOfClass:[NBFunction class]]?(NBFunction *)d.fragmentFunction:nil;
+ line+=" | v ";line+=vf?vf.name.UTF8String:"-";line+=" ";line+=vf?vf.constantsText:"";
+ line+=" | f ";line+=ff?ff.name.UTF8String:"-";line+=" ";line+=ff?ff.constantsText:"";
+ if(refused){line+=" | refused ";line+=refused;}
+ for(char &c:line)if(c=='\n')c=' ';
+ journal(line);
+}
 // A render pipeline descriptor in the bridge's form; false, with the error, for a function of another device.
 static bool renderDescriptor(MTLRenderPipelineDescriptor *d,NmbRenderPipelineDescriptor *p,NSError **error) {
  if(![(id)d.vertexFunction isKindOfClass:[NBFunction class]] || (d.fragmentFunction && ![(id)d.fragmentFunction isKindOfClass:[NBFunction class]])) {
@@ -1257,6 +1310,7 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
  const NmbPipelineOptions creation={(uint64_t)options,archives.data(),archives.size()};
  const uint64_t pipelineBegan=nowUs();
  NmbRenderPipeline *handle=nmb_render_pipeline_new_with_options(gDevice,p,&creation);delete p;gTimePipeline.add(pipelineBegan);
+ journalRenderPipeline(d,pipelineBegan,handle?nullptr:nmb_last_error());
  if(!handle)return failWith<id<MTLRenderPipelineState>>(error,@"render pipeline",nil);
  NBRenderPipeline *state=[NBRenderPipeline new];state.handle=handle;gPipelines++;if(error)*error=nil;return (id<MTLRenderPipelineState>)state;
 }
@@ -1327,6 +1381,7 @@ extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint
  gMissing=missing;gInFlight=[NSMutableSet set];
  gDevice=nmb_device_open(loader,cache);
  if(!gDevice){NBLOG(@"native-metal: device refused: %s",nmb_last_error());return nil;}
+ if(cache){gJournalPath=std::string(cache)+"/pipelines.log";gJournalBegan=nowUs();}
  char name[128]={};nmb_device_name(gDevice,name,sizeof name);gName=[NSString stringWithUTF8String:name];gRegistryID=registryID;
  Class base=objc_getClass("_MTLDevice");
 #if !TARGET_OS_IPHONE
