@@ -1,0 +1,205 @@
+diff --git a/crates/metal2vulkan-air/src/canon/const_loads.rs b/crates/metal2vulkan-air/src/canon/const_loads.rs
+index 7b3dfd7..98976df 100644
+--- a/crates/metal2vulkan-air/src/canon/const_loads.rs
++++ b/crates/metal2vulkan-air/src/canon/const_loads.rs
+@@ -1,4 +1,4 @@
+-//! Pointers loaded from fields of constant globals.
++//! Values loaded from fields of constant globals.
+ //!
+ //! A constant global whose initializer is known once function constants are bound and the static
+ //! initializers have run may hold pointers: a program-scope `constexpr sampler` taken by value is
+@@ -9,18 +9,28 @@
+ //! constant and threadgroup spaces, so such a module was refused, under the values that made the
+ //! select one global.
+ //!
++//! The same holds for every other first-class field. An uber-shader takes its whole configuration
++//! as one struct of function constants that a static initializer copies into an internal
++//! `constant` global (QuartzCore's `fc_fragment_shader_config`, read field by field after a
++//! function-constant `select` between it and a buffer). SCCP folds that select to the global but
++//! not the field loads, so every branch the configuration decides survived: QuartzCore's
++//! `fixed_frag` became about 46000 SPIR-V instructions where its specialized form is a few
++//! hundred, and the driver compiled each such pipeline for about a second. Metal's compiler
++//! specializes these reads away, so a module that reads them is translated as Metal compiles it.
++//!
+ //! This pass reads such a load as the initializer's constant at the field: a non-volatile,
+-//! non-atomic load of a pointer whose address is a field of a constant global at constant indices
+-//! (a `getelementptr` instruction or constant expression over the global's own value type, its
+-//! first index 0), where the field's type is the load's. A copy LLVM made through an integer (a
+-//! load of the field as an integer of the pointer's size, then `inttoptr` to the field's type)
+-//! reads the same constant at its `inttoptr`. The global is never written (it is `constant`, and
+-//! initialized by no one else), so every run reads that constant: the address of the sampler
+-//! state, which the sampler family reads as the sampler it names. Only pointers are read this
+-//! way: a load of any other type from a constant global is lowered from the global's form (its
+-//! typed private copy, or the constant blob), and reading it here would change those modules
+-//! without changing what they compute. SCCP then runs again over a body this pass changed, so
+-//! what the constants decide (an aggregate of them, a phi of them, a member of either) folds too.
++//! non-atomic load of a scalar, vector or pointer whose address is a field of a constant global at
++//! constant indices (a `getelementptr` instruction or constant expression over the global's own
++//! value type, its first index 0), where the field's type is the load's. A copy LLVM made through
++//! an integer (a load of a pointer field as an integer of the pointer's size, then `inttoptr` to
++//! the field's type) reads the same constant at its `inttoptr`. The global is never written (it
++//! is `constant`, and initialized by no one else), so every run reads that constant: for a
++//! pointer, the address of the sampler state, which the sampler family reads as the sampler it
++//! names. An aggregate load, a load of another type than the field's, and a field the initializer
++//! leaves `undef` (an unsupplied constant's) are left to the global's lowered form. SCCP then runs
++//! again over a body this pass changed, so what the constants decide (a branch, an aggregate of
++//! them, a phi of them, a member of either) folds too, and the two alternate until a round folds
++//! nothing: a decided branch can expose a further select of the global.
+ 
+ use crate::budget::Meter;
+ use crate::error::Error;
+@@ -29,9 +39,9 @@ use crate::ir::{InstId, InstKind, ModuleParts, Type, TypeId, Value};
+ 
+ use super::rewrite::{apply, scoped, BodyEdit};
+ 
+-/// Read every load of a pointer from a field of a constant global in `body`, and every
+-/// `inttoptr` of such a field's integer copy, as the field's constant (module docs), and say
+-/// whether there was one. Returns `body` itself when there is none.
++/// Read every first-class load from a field of a constant global in `body`, and every `inttoptr`
++/// of a pointer field's integer copy, as the field's constant (module docs), and say whether there
++/// was one. Returns `body` itself when there is none.
+ pub(super) fn fold(
+     body: Body,
+     parts: &mut ModuleParts,
+@@ -61,8 +71,8 @@ pub(super) fn fold(
+     }
+ }
+ 
+-/// Each instruction of `body` that reads a pointer field of a constant global (module docs), with
+-/// the field's constant.
++/// Each instruction of `body` that reads a first-class field of a constant global (module docs),
++/// with the field's constant.
+ fn find(
+     body: &Body,
+     parts: &mut ModuleParts,
+@@ -71,24 +81,27 @@ fn find(
+ ) -> Result<(), Error> {
+     for (id, inst) in body.insts.iter() {
+         m.tick(1)?;
+-        let Some(space) = parts.types.ptr_space(inst.ty) else {
+-            continue;
+-        };
+-        if !matches!(parts.types.get(inst.ty), Some(Type::Ptr { .. })) {
+-            continue;
+-        }
++        let first_class = parts
++            .types
++            .get(inst.ty)
++            .is_some_and(|t| t.is_sized() && !t.is_aggregate());
++        let pointer = matches!(parts.types.get(inst.ty), Some(Type::Ptr { .. }));
+         let ptr = match inst.kind {
+             InstKind::Load {
+                 ptr,
+                 volatile: false,
+                 atomic: None,
+                 ..
+-            } => ptr,
++            } if first_class => ptr,
+             // `inttoptr` of an integer load of the pointer's size: a copy through an integer.
+             InstKind::Cast {
+                 op: CastOp::IntToPtr,
+                 v: Value::Inst(l),
+-            } => match body.insts.get(l).map(|l| (&l.kind, l.ty)) {
++            } if pointer => {
++                let Some(space) = parts.types.ptr_space(inst.ty) else {
++                    continue;
++                };
++                match body.insts.get(l).map(|l| (&l.kind, l.ty)) {
+                 Some((
+                     &InstKind::Load {
+                         ptr,
+@@ -104,7 +117,8 @@ fn find(
+                     ptr
+                 }
+                 _ => continue,
+-            },
++                }
++            }
+             _ => continue,
+         };
+         let Some((g, path)) = field_address(body, parts, ptr) else {
+diff --git a/crates/metal2vulkan-air/src/canon/mod.rs b/crates/metal2vulkan-air/src/canon/mod.rs
+index bd05d94..e3bd590 100644
+--- a/crates/metal2vulkan-air/src/canon/mod.rs
++++ b/crates/metal2vulkan-air/src/canon/mod.rs
+@@ -567,11 +567,17 @@ pub fn specialize_dynamic(
+     };
+     body.release(m);
+     let body = solved;
+-    // A pointer loaded from a field of a constant global is the field's constant: a `constexpr
+-    // sampler` that SCCP's folded select picked is its sampler state. SCCP runs again over a body
+-    // that changed, to fold what those constants decide.
+-    let (body, folded) = const_loads::fold(body, &mut parts, m)?;
+-    let body = if folded {
++    // A value loaded from a field of a constant global is the field's constant: a `constexpr
++    // sampler` that SCCP's folded select picked is its sampler state, and an uber-shader's
++    // configuration struct of function constants is its members. SCCP runs again over a body that
++    // changed, to fold what those constants decide; the two alternate until a round folds nothing.
++    let mut body = body;
++    loop {
++        let (next, folded) = const_loads::fold(body, &mut parts, m)?;
++        if !folded {
++            body = next;
++            break;
++        }
+         let solved = {
+             let mut cx = sccp::Context {
+                 folder: fold::Folder {
+@@ -583,13 +589,11 @@ pub fn specialize_dynamic(
+                 fcs: &fcs,
+                 name: name.clone(),
+             };
+-            sccp::run(&body, &mut cx, m)?
++            sccp::run(&next, &mut cx, m)?
+         };
+-        body.release(m);
+-        solved
+-    } else {
+-        body
+-    };
++        next.release(m);
++        body = solved;
++    }
+     matmul2d::refuse_left(&body, &parts, &ep.stage, &name, m)?;
+     post_check(&body, &parts, &stubs, &name, &control_points(ep), m)?;
+     // Rasterization-rate maps: each `float2` map call becomes Apple's GPU decoder of the parameter
+diff --git a/crates/metal2vulkan-air/src/canon/tests.rs b/crates/metal2vulkan-air/src/canon/tests.rs
+index fb0dad5..93edc0a 100644
+--- a/crates/metal2vulkan-air/src/canon/tests.rs
++++ b/crates/metal2vulkan-air/src/canon/tests.rs
+@@ -1658,7 +1658,18 @@ fn a_deeply_nested_written_global_is_rebuilt_on_a_small_stack() {
+         static_init(&mut m, "init", |f| store(f, five, gaddr));
+         let fty = m.fn_ty(void, &[dev]);
+         let mut f = m.define("k", fty);
+-        let v = load(&mut f, i32t, gaddr);
++        // A volatile read keeps the global: a plain one now reads the rebuilt initializer's leaf
++        // as its constant, and the unused global is pruned.
++        let v = f.push(
++            i32t,
++            InstKind::Load {
++                ptr: gaddr,
++                align: Align::from_bytes(4),
++                volatile: true,
++                atomic: None,
++                range: None,
++            },
++        );
+         store(&mut f, v, arg(0));
+         f.ret(None);
+         let k = f.finish();
+@@ -2359,9 +2370,12 @@ fn a_pointer_loaded_from_a_constant_globals_field_is_the_fields_constant() {
+             assert!(text.contains(kept) && !text.contains(gone), "{text}");
+         }
+     }
+-    // A field of any other type is left to the memory plan: its load stays.
+-    let text = body_text(&picked_field(Some(1), 1).unwrap());
+-    assert!(text.contains("getelementptr"), "{text}");
++    // A field of any other first-class type reads the same way: the picked struct's own `i64`.
++    for (flag, kept, gone) in [(1, "333", "444"), (0, "444", "333")] {
++        let text = body_text(&picked_field(Some(flag), 1).unwrap());
++        assert!(!text.contains("getelementptr") && !text.contains("load"), "{text}");
++        assert!(text.contains(kept) && !text.contains(gone), "{text}");
++    }
+     // Unsupplied, the select stays undecided, as before.
+     assert_eq!(
+         picked_field(None, 0).unwrap_err(),
