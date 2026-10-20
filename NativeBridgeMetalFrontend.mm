@@ -335,6 +335,7 @@ static uint64_t constantBytes(uint64_t type) {
   default:return 0;
  }
 }
+static std::string quartzCoreCallers();
 @implementation NBLibrary
 - (void)dealloc {nmb_library_release(_handle);}
 - (id<MTLFunction>)newFunctionWithName:(NSString *)name constantValues:(MTLFunctionConstantValues *)values error:(NSError **)error {
@@ -362,7 +363,17 @@ static uint64_t constantBytes(uint64_t type) {
  }
  const uint64_t functionBegan=nowUs();
  NmbFunction *handle=nmb_function_new_specialized(_handle,name.UTF8String,constants.data(),(uint32_t)constants.size());gTimeFunction.add(functionBegan);
- if(!handle){if(error)*error=nbError([NSString stringWithFormat:@"specialized function: %@",lastError()]);return nil;}
+ // One S line per specialization (int-155: every QuartzCore pipeline was made on its draw, and a refused generic function would leave its
+ // generic pipeline unmade without a word): the function, its constants, the time, the refusal and QuartzCore's callers.
+ if(!gJournalPath.empty()) {
+  char head[96];snprintf(head,sizeof head,"S t=%llu us=%llu ok=%d name=",(unsigned long long)((functionBegan-gJournalBegan)/1000),
+      (unsigned long long)(nowUs()-functionBegan),handle?1:0);
+  journal(head+std::string(name.UTF8String?:"?")+" k="+text+(handle?std::string():" err="+std::string(lastError().UTF8String?:"?"))+" | "+quartzCoreCallers());
+ }
+ if(!handle){
+  noteProblem([NSString stringWithFormat:@"specialized function %@: %@",name,lastError()]);
+  if(error)*error=nbError([NSString stringWithFormat:@"specialized function: %@",lastError()]);return nil;
+ }
  NBFunction *function=[NBFunction new];function.handle=handle;function.name=name;function.functionType=(MTLFunctionType)nmb_function_type(handle);
  function.constantsText=text;if(error)*error=nil;return (id<MTLFunction>)function;
 }
@@ -389,7 +400,8 @@ static uint64_t constantBytes(uint64_t type) {
 }
 - (id<MTLFunction>)newFunctionWithName:(NSString *)name {
  const uint64_t functionBegan=nowUs();
- NmbFunction *handle=name?nmb_function_new(_handle,name.UTF8String):nullptr;gTimeFunction.add(functionBegan);if(!handle)return nil;
+ NmbFunction *handle=name?nmb_function_new(_handle,name.UTF8String):nullptr;gTimeFunction.add(functionBegan);
+ if(!handle)return nil;
  NBFunction *function=[NBFunction new];function.handle=handle;function.name=name;function.functionType=(MTLFunctionType)nmb_function_type(handle);
  return (id<MTLFunction>)function;
 }
@@ -1202,7 +1214,8 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
 - (BOOL)isLowPower {return NO;}
 - (BOOL)isRemovable {return NO;}
 - (BOOL)isHeadless {return NO;}
-// supportsFamily: and the other queries the runtime answers are installed from it (installAnswers). No legacy feature set is claimed: the
+// supportsFamily: and the other queries the runtime answers are installed from it (installAnswers); supportsFamily: also answers the target
+// hardware's families (the bridge's TARGET_FAMILIES, journaled with their waived rows as F lines). No legacy feature set is claimed: the
 // base implementation reads Apple tables this device does not have.
 - (BOOL)supportsFeatureSet:(MTLFeatureSet)set {(void)set;return NO;}
 // The original discovery (_MTLAddDevice) runs these four on every device it registers. The target's own versions fill the base class's limits
@@ -1436,6 +1449,9 @@ extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint
  if(!gDevice){NBLOG(@"native-metal: device refused: %s",nmb_last_error());return nil;}
  if(cache){gJournalPath=std::string(cache)+"/pipelines.log";gJournalBegan=nowUs();}
  char name[128]={};nmb_device_name(gDevice,name,sizeof name);gName=[NSString stringWithUTF8String:name];gRegistryID=registryID;
+ // The target families supportsFamily: answers true, with the rows of Apple's tables the device does not meet in them (nmb_device_family_waivers).
+ {char waived[4096]={};nmb_device_family_waivers(gDevice,waived,sizeof waived);
+  for(char *line=waived,*next;*line;line=next){next=strchr(line,'\n');if(next)*next++=0;else next=line+strlen(line);journal(std::string("F ")+line);}}
  Class base=objc_getClass("_MTLDevice");
 #if !TARGET_OS_IPHONE
  // Host instrument: on NSObject every selector a client sends that this file lacks reaches the missing hook, instead of the host's
