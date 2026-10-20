@@ -1037,9 +1037,30 @@ static std::string quartzCoreCallers() {
  }
  return out;
 }
+// What a creation cost beyond its wall time (int-156: a translation the host does in 6 ms took 665 ms on the tablet, whose single core is
+// as fast): this thread's CPU time (user and system, microseconds) and the task's page faults, page-ins and context switches. A creation
+// whose CPU time is near its wall time computed; one whose faults are many paid the 4 KiB fault path; one far below it waited.
+struct NBCost {
+ uint64_t user=0,system=0;int64_t faults=0,pageins=0,switches=0;
+ static NBCost now() {
+  NBCost c;thread_basic_info_data_t t{};mach_msg_type_number_t n=THREAD_BASIC_INFO_COUNT;mach_port_t self=mach_thread_self();
+  if(thread_info(self,THREAD_BASIC_INFO,(thread_info_t)&t,&n)==KERN_SUCCESS) {
+   c.user=(uint64_t)t.user_time.seconds*1000000+t.user_time.microseconds;c.system=(uint64_t)t.system_time.seconds*1000000+t.system_time.microseconds;
+  }
+  mach_port_deallocate(mach_task_self(),self);
+  task_events_info_data_t e{};n=TASK_EVENTS_INFO_COUNT;
+  if(task_info(mach_task_self(),TASK_EVENTS_INFO,(task_info_t)&e,&n)==KERN_SUCCESS){c.faults=e.faults;c.pageins=e.pageins;c.switches=e.csw;}
+  return c;
+ }
+ std::string since(const NBCost &b) const {
+  char text[128];snprintf(text,sizeof text," cpu=%llu sys=%llu flt=%lld pin=%lld csw=%lld",(unsigned long long)(user+system-b.user-b.system),
+      (unsigned long long)(system-b.system),(long long)(faults-b.faults),(long long)(pageins-b.pageins),(long long)(switches-b.switches));
+  return text;
+ }
+};
 // One journal line of a render pipeline creation begun at `began` (microseconds), `refused` its refusal or null. The label is the
 // caller's name for the pipeline (QuartzCore's: its spec's encoded name).
-static void journalRenderPipeline(MTLRenderPipelineDescriptor *d,uint64_t began,const char *refused) {
+static void journalRenderPipeline(MTLRenderPipelineDescriptor *d,uint64_t began,const char *refused,const std::string &cost) {
  if(gJournalPath.empty())return;
  const uint64_t ended=nowUs();uint64_t tid=0;pthread_threadid_np(nullptr,&tid);
  char head[256];
@@ -1047,6 +1068,7 @@ static void journalRenderPipeline(MTLRenderPipelineDescriptor *d,uint64_t began,
      (unsigned long long)tid,pthread_main_np(),(unsigned long long)(ended-began),refused?0:1,(unsigned long)d.rasterSampleCount,
      (unsigned long)d.inputPrimitiveTopology,(unsigned long)d.depthAttachmentPixelFormat,(unsigned long)d.stencilAttachmentPixelFormat);
  std::string line=head;
+ line+=cost;
  line+=" label=";line+=d.label.length?d.label.UTF8String:"-";
  for(unsigned i=0;i<8;i++) {
   MTLRenderPipelineColorAttachmentDescriptor *a=d.colorAttachments[i];if(a.pixelFormat==MTLPixelFormatInvalid)continue;
@@ -1374,9 +1396,9 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
  std::vector<NmbBinaryArchive *> archives;
  if(!pipelineArchives(d.binaryArchives,archives,error)){delete p;return nil;}
  const NmbPipelineOptions creation={(uint64_t)options,archives.data(),archives.size()};
- const uint64_t pipelineBegan=nowUs();
+ const uint64_t pipelineBegan=nowUs();const NBCost costBegan=NBCost::now();
  NmbRenderPipeline *handle=nmb_render_pipeline_new_with_options(gDevice,p,&creation);delete p;gTimePipeline.add(pipelineBegan);
- journalRenderPipeline(d,pipelineBegan,handle?nullptr:nmb_last_error());
+ journalRenderPipeline(d,pipelineBegan,handle?nullptr:nmb_last_error(),gJournalPath.empty()?std::string():NBCost::now().since(costBegan));
  if(!handle)return failWith<id<MTLRenderPipelineState>>(error,@"render pipeline",nil);
  NBRenderPipeline *state=[NBRenderPipeline new];state.handle=handle;gPipelines++;if(error)*error=nil;return (id<MTLRenderPipelineState>)state;
 }
