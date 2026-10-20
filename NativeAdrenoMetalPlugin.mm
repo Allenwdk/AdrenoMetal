@@ -4,8 +4,9 @@
 // process, under that process's sandbox, and then returns nil. No device is registered, so the original software rendering keeps running unchanged.
 // Published (the image carries the file NativeAdrenoMetal.publish beside the bundle): backboardd, the one process that owns the GPU, returns the native
 // Metal frontend's device (the metal2vulkan runtime on Turnip, on the Adreno 740), which the original discovery registers; the CARenderServer then
-// renders the system UI through it, and the display driver's frames are written to the scanout by the GPU (GpuScanoutClient.h). Every other process
-// returns nil and keeps the software renderer.
+// renders the system UI through it, and the display driver's frames are written to the scanout by the GPU (GpuScanoutClient.h). Another process
+// gets its own native device (its own driver connection, GPU address window and shader cache) when its name is listed in the file
+// NativeAdrenoMetal.clients beside the bundle ("*" lists every process); an unlisted one returns nil and keeps the software renderer.
 #import <Foundation/Foundation.h>
 #include <pthread.h>
 #include <dlfcn.h>
@@ -132,14 +133,58 @@ static void reportDisplayState(Gpu &gpu) {
         markSample(gpu, now, 0xA000);
     } @catch (NSException *) {}
 }
+// Whether NativeAdrenoMetal.clients names this process (names separated by blanks, commas or new lines; "*" names every process).
+static bool listedClient() {
+    char path[1024];
+    if (!requestedPath("NativeAdrenoMetal.clients", path, sizeof path)) return false;
+    FILE *file = fopen(path, "r");
+    if (!file) return false;
+    char text[1024] = {};
+    const size_t length = fread(text, 1, sizeof text - 1, file);
+    fclose(file);
+    text[length] = 0;
+    const char *self = getprogname();
+    for (char *save = nullptr, *name = strtok_r(text, " ,\t\r\n", &save); name; name = strtok_r(nullptr, " ,\t\r\n", &save))
+        if (!strcmp(name, "*") || !strcmp(name, self)) return true;
+    return false;
+}
+// A listed process other than the render server: the same runtime on its own connection, with none of the render server's threads (no
+// display hand-off, telemetry, benchmark or cache export). Its shader cache lives in its own cache or temp directory.
+static id clientDevice(unsigned port) {
+    if (!listedClient()) return nil;
+    char turnip[1024];
+    if (!turnip::libraryPath(turnip, sizeof turnip) || access(turnip, R_OK) != 0) return nil;
+    uint64_t registryID = 0;
+    if (void *iokit = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW | RTLD_LOCAL)) {
+        if (auto retain = (int (*)(unsigned))dlsym(iokit, "IOObjectRetain")) retain(port);
+        if (auto entryID = (int (*)(unsigned, uint64_t *))dlsym(iokit, "IORegistryEntryGetRegistryEntryID")) entryID(port, &registryID);
+    }
+    // IOSurfaces this GPU reads or writes must be plain rows, as in the render server.
+    CFPreferencesSetAppValue(CFSTR("CAEnableIOSurfaceCompression"), kCFBooleanFalse, kCFPreferencesCurrentApplication);
+    char candidates[2][512] = {};
+    if (!confstr(_CS_DARWIN_USER_CACHE_DIR, candidates[0], sizeof candidates[0] - 16)) candidates[0][0] = 0;
+    if (!confstr(_CS_DARWIN_USER_TEMP_DIR, candidates[1], sizeof candidates[1] - 16)) candidates[1][0] = 0;
+    id device = nil;
+    for (unsigned i = 0; i < 2 && !device; ++i) {
+        if (!candidates[i][0]) continue;
+        strlcat(candidates[i], "m2v", sizeof candidates[i]);
+        mkdir(candidates[i], 0700);
+        if (access(candidates[i], W_OK) != 0) continue;
+        @try {
+            device = native_bridge_metal_open(turnip, candidates[i], registryID, nullptr);
+        } @catch (NSException *exception) {
+            device = nil;
+        }
+    }
+    return device;
+}
 static id deviceForPort(unsigned port) {
     static id device;
     static bool tried;
     @synchronized([NativeAdrenoMetalDeviceBase class]) {
         if (tried) return device;
         tried = true;
-        // One process owns the GPU (the driver grants one connection): the render server. The others keep the software renderer.
-        if (strcmp(getprogname(), "backboardd") != 0) return nil;
+        if (strcmp(getprogname(), "backboardd") != 0) return device = clientDevice(port);
         // The discovery releases the accelerator port when it is done; the monitor and the scanout client keep using it.
         if (void *iokit = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW | RTLD_LOCAL)) {
             if (auto retain = (int (*)(unsigned))dlsym(iokit, "IOObjectRetain")) retain(port);
@@ -246,14 +291,13 @@ static id deviceForPort(unsigned port) {
             }
             return nullptr;
         }, gpu);
-        // The fixed CPU/memory/pipeline workload of native_bridge_metal_benchmark, once while the render server starts and once on an idle
-        // desktop, against the host's run of the same (pipeline_timing_host draw=2): how much slower the tablet is, and where.
+        // The fixed CPU/memory/pipeline workload of native_bridge_metal_benchmark, once while the render server starts, against the host's run
+        // of the same (pipeline_timing_host draw=2): how much slower the tablet is, and where. Its second run on the desktop (150 s later) fell
+        // inside the user's testing and competed with the UI for the GPU (int-154), so it is gone.
         pthread_t benchmark;
         pthread_create(&benchmark, &attributes, [](void *arg) -> void * {
             id dev = (__bridge id)arg;
             sleep(3);
-            native_bridge_metal_benchmark(dev, "/System/Library/Frameworks/QuartzCore.framework/default.metallib", 8, nullptr, 0);
-            sleep(150);
             native_bridge_metal_benchmark(dev, "/System/Library/Frameworks/QuartzCore.framework/default.metallib", 8, nullptr, 0);
             return nullptr;
         }, (__bridge void *)device);

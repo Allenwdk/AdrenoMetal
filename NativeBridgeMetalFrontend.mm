@@ -19,6 +19,9 @@
 #include <vector>
 #include <sys/mman.h>
 #include <CommonCrypto/CommonDigest.h>
+#include <dlfcn.h>
+#include <execinfo.h>
+#include <mach/mach.h>
 #include "bridge/NativeMetalObjects.h"
 #include "NativeBridgeMetalFrontend.h"
 
@@ -973,6 +976,55 @@ template <typename T> static T failWith(NSError **error,NSString *what,T value) 
  if(error)*error=nbError([NSString stringWithFormat:@"%@: %@",what,lastError()]);
  return value;
 }
+// Which of QuartzCore's paths asked for a pipeline (int-153: every one was made synchronously on its render thread and no generic pipeline
+// was ever asked for): its return addresses as offsets from its image header (header 0x189429000 in the 21H461 cache, so offset +
+// 0x189429000 is the address in that image's disassembly), the global feature flags it ORs into every context's flags, and its
+// CA_DISABLE_GENERIC_SHADERS, CA_FORCE_GENERIC_SHADERS and CA_DISABLE_PRECOMPILED_PIPELINES debug options (ca_debug_options +0x55..0x57,
+// read only where dladdr places that address in QuartzCore).
+static std::string quartzCoreCallers() {
+ void *frames[24];const int n=backtrace(frames,24);
+ std::string out="qc";char item[32];unsigned kept=0;uintptr_t header=0;
+ for(int i=0;i<n && kept<8;i++) {
+  Dl_info info{};
+  if(!dladdr(frames[i],&info) || !info.dli_fname || !strstr(info.dli_fname,"/QuartzCore"))continue;
+  header=(uintptr_t)info.dli_fbase;
+  snprintf(item,sizeof item," %lx",(unsigned long)((uintptr_t)frames[i]-header));out+=item;++kept;
+ }
+ // The context's own flags (int-154: the draws never took the generic path, which only bit 18 of MetalContext +0x1a0 or the debug byte
+ // can cause, and the debug byte was 0). MetalContext::create_pipeline_state (header +0x143000) saves its caller's x19 at fp-8, and its
+ // caller MetalContext::draw keeps `this` in x19: the frame record whose return address is +0x143214 links to that frame. Read with
+ // vm_read so a different stack layout reports ctx=? instead of faulting.
+ if(header) {
+  uintptr_t fp=(uintptr_t)__builtin_frame_address(0),ctx=0;
+  for(unsigned depth=0;fp && depth<24;++depth) {
+   uintptr_t record[2]={};vm_size_t got=0;
+   if(vm_read_overwrite(mach_task_self(),fp,sizeof record,(vm_address_t)record,&got)!=KERN_SUCCESS || got!=sizeof record)break;
+   if(record[1]-header==0x143214) {
+    uintptr_t saved=0;
+    if(record[0] && vm_read_overwrite(mach_task_self(),record[0]-8,sizeof saved,(vm_address_t)&saved,&got)==KERN_SUCCESS)ctx=saved;
+    break;
+   }
+   if(record[0]<=fp)break;
+   fp=record[0];
+  }
+  uint32_t flags[2]={};vm_size_t got=0;
+  if(ctx && vm_read_overwrite(mach_task_self(),ctx+0x1a0,4,(vm_address_t)&flags[0],&got)==KERN_SUCCESS &&
+     vm_read_overwrite(mach_task_self(),ctx+0xb3c,4,(vm_address_t)&flags[1],&got)==KERN_SUCCESS) {
+   snprintf(item,sizeof item," ctx=%x/%x",flags[0],flags[1]);out+=item;
+  } else out+=" ctx=?";
+ }
+ static auto global=(uint32_t (*)(void))dlsym(RTLD_DEFAULT,"CARenderGetGlobalFeatureFlags");
+ snprintf(item,sizeof item," global=%x",global?global():0xffffffffu);out+=item;
+ if(header) {
+  const uintptr_t options=header+(0x1f491b3c5ull-0x189429000ull);
+  Dl_info info{};
+  if(dladdr((void *)options,&info) && info.dli_fname && strstr(info.dli_fname,"/QuartzCore") && (uintptr_t)info.dli_fbase==header) {
+   const volatile uint8_t *b=(const volatile uint8_t *)options;
+   snprintf(item,sizeof item," dbg=%u%u%u",b[0],b[1],b[2]);out+=item;
+  } else out+=" dbg=?";
+ }
+ return out;
+}
 // One journal line of a render pipeline creation begun at `began` (microseconds), `refused` its refusal or null. The label is the
 // caller's name for the pipeline (QuartzCore's: its spec's encoded name).
 static void journalRenderPipeline(MTLRenderPipelineDescriptor *d,uint64_t began,const char *refused) {
@@ -1003,6 +1055,7 @@ static void journalRenderPipeline(MTLRenderPipelineDescriptor *d,uint64_t began,
  line+=" | v ";line+=vf?vf.name.UTF8String:"-";line+=" ";line+=vf?vf.constantsText:"";
  line+=" | f ";line+=ff?ff.name.UTF8String:"-";line+=" ";line+=ff?ff.constantsText:"";
  if(refused){line+=" | refused ";line+=refused;}
+ line+=" | ";line+=quartzCoreCallers();
  for(char &c:line)if(c=='\n')c=' ';
  journal(line);
 }
