@@ -194,6 +194,18 @@ static id clientDevice(unsigned port) {
         if (!device && !lastError[0]) lastError = nmb_last_error();
     }
     if (!device) clientFailure(port, usable ? "no-device" : "no-cachedir", lastError);
+    // The client's first problem, once, on the same text line: WidgetRenderer crashed on a nil render encoder with no reason anywhere readable
+    // (its own log lines need the plugin's format strings, which the device does not keep). Checked every second for ten minutes.
+    if (device) {
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            for (unsigned second = 0; second < 600; ++second) {
+                char problem[200] = {};
+                const uint64_t count = native_bridge_metal_first_problem(problem, sizeof problem);
+                if (count) {clientFailure(port, "problem", problem); return;}
+                sleep(1);
+            }
+        });
+    }
     return device;
 }
 static id deviceForPort(unsigned port) {

@@ -63,9 +63,12 @@ extern "C" unsigned native_bridge_metal_recent_commits(uint64_t windowUs) {
 }
 static std::mutex gProblemLock;
 static char gLastProblems[2][200];
+// The process's first problem, kept: a client process has no telemetry table, and its first refusal is usually the cause of the rest.
+static char gFirstProblem[200];
 static void noteProblem(NSString *what) {
  gProblems++;
  std::lock_guard<std::mutex> lock(gProblemLock);
+ if(!gFirstProblem[0])strlcpy(gFirstProblem,what.UTF8String?:"?",sizeof gFirstProblem);
  memcpy(gLastProblems[1],gLastProblems[0],sizeof gLastProblems[0]);
  strlcpy(gLastProblems[0],what.UTF8String?:"?",sizeof gLastProblems[0]);
 }
@@ -1781,6 +1784,11 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
  return at;
 }
 
+extern "C" uint64_t native_bridge_metal_first_problem(char *out,size_t size) {
+ std::lock_guard<std::mutex> lock(gProblemLock);
+ if(size)strlcpy(out,gFirstProblem,size);
+ return gProblems.load();
+}
 extern "C" size_t native_bridge_metal_formats(char *out,size_t size) {
  std::lock_guard<std::mutex> lock(gProblemLock);
  return native_bridge_metal_formats_locked(out,size);
