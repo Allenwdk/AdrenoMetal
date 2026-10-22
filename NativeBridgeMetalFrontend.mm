@@ -65,6 +65,8 @@ static void noteProblem(NSString *what) {
 #define NBLOG(...) do{NSString *nbText=[NSString stringWithFormat:__VA_ARGS__];NSLog(@"%@",nbText);noteProblem(nbText);}while(0)
 // The pixel formats textures were asked for (first eight distinct), with how many were refused: native_bridge_metal_formats.
 static uint32_t gFormats[8];static unsigned gFormatCount;static std::atomic<uint64_t> gTextureRefusals;
+// Textures over IOSurfaces: made, refused, and how many of the requests named a planar surface.
+static std::atomic<uint64_t> gSurfaceTextures,gSurfaceRefusals,gSurfacePlanar;
 static void noteFormat(uint32_t format,bool made) {
  std::lock_guard<std::mutex> lock(gProblemLock);
  if(!made)gTextureRefusals++;
@@ -1346,13 +1348,20 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
 // The surface's pages are the texels: its mapping in this process is imported without a copy (pinned by the kernel, mapped into the GPU's
 // 4 KiB context by Turnip), so every process that imports the surface renders and samples the same memory.
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d iosurface:(IOSurfaceRef)surface plane:(NSUInteger)plane {
- if(!surface || !d || plane || IOSurfaceGetPlaneCount(surface))return nil;
+ // A planar surface (Apple's lossless-compressed BGRA spelling has one plane, video formats two) is imported whole; the texture starts at
+ // the plane's own address and rows. Only a plain surface has no planes, and then only plane 0 exists.
+ const size_t planes=surface?IOSurfaceGetPlaneCount(surface):0;
+ if(!surface || !d || (planes?plane>=planes:plane!=0)){gSurfaceRefusals++;return nil;}
+ if(planes)gSurfacePlanar++;
  void *base=IOSurfaceGetBaseAddress(surface);const size_t page=(size_t)getpagesize(),allocation=IOSurfaceGetAllocSize(surface);
- if(!page || (page&(page-1)) || !base || ((uintptr_t)base&(page-1)) || !allocation || allocation>SIZE_MAX-(page-1))return nil;
+ if(!page || (page&(page-1)) || !base || ((uintptr_t)base&(page-1)) || !allocation || allocation>SIZE_MAX-(page-1)){gSurfaceRefusals++;return nil;}
+ const uintptr_t start=planes?(uintptr_t)IOSurfaceGetBaseAddressOfPlane(surface,plane):(uintptr_t)base;
+ const size_t row=planes?IOSurfaceGetBytesPerRowOfPlane(surface,plane):IOSurfaceGetBytesPerRow(surface);
+ if(start<(uintptr_t)base || start-(uintptr_t)base>=allocation || !row){gSurfaceRefusals++;return nil;}
  const size_t bytes=(allocation+page-1)&~(page-1);
- NBBuffer *buffer=surfaceBuffer(surface,base,bytes);if(!buffer)return nil;
- NBTexture *texture=textureOnBuffer(buffer,d,0,IOSurfaceGetBytesPerRow(surface),true);if(!texture)return nil;
- texture.surface=(IOSurfaceRef)CFRetain(surface);return (id<MTLTexture>)texture;
+ NBBuffer *buffer=surfaceBuffer(surface,base,bytes);if(!buffer){gSurfaceRefusals++;return nil;}
+ NBTexture *texture=textureOnBuffer(buffer,d,start-(uintptr_t)base,row,true);if(!texture){gSurfaceRefusals++;return nil;}
+ gSurfaceTextures++;texture.surface=(IOSurfaceRef)CFRetain(surface);return (id<MTLTexture>)texture;
 }
 - (id<MTLLibrary>)newLibraryWithData:(dispatch_data_t)data error:(NSError **)error {
  const void *bytes=nullptr;size_t size=0;dispatch_data_t mapped=dispatch_data_create_map(data,&bytes,&size);
@@ -1561,7 +1570,8 @@ extern "C" size_t native_bridge_metal_status(char *out,size_t size) {
 }
 
 static size_t native_bridge_metal_formats_locked(char *out,size_t size) {
- int n=snprintf(out,size,"tex x%llu f",(unsigned long long)gTextureRefusals.load());
+ int n=snprintf(out,size,"tex x%llu s%llu/%llu p%llu f",(unsigned long long)gTextureRefusals.load(),(unsigned long long)gSurfaceTextures.load(),
+              (unsigned long long)gSurfaceRefusals.load(),(unsigned long long)gSurfacePlanar.load());
  for(unsigned i=0;i<gFormatCount && n>0 && (size_t)n<size;i++)n+=snprintf(out+n,size-(size_t)n,"%u ",gFormats[i]);
  return n>0?(size_t)n:0;
 }
