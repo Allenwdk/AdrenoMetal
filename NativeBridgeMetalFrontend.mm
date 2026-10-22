@@ -54,6 +54,13 @@ struct EncodedWork {uint32_t passes,draws,dispatches,blits;uint64_t pixels;};
 struct CommitRecord {uint64_t committedUs=0,callbackUs=0,ageUs=0;int64_t scheduledUs=-1;uint32_t index=0;EncodedWork work={};};
 static CommitRecord gCommitRing[32];
 static std::mutex gCommitLock;
+// Command buffers committed in the last windowUs microseconds (at most the ring's 32): shader priming waits while the render server animates.
+extern "C" unsigned native_bridge_metal_recent_commits(uint64_t windowUs) {
+ const uint64_t now=nowUs();unsigned n=0;
+ std::lock_guard<std::mutex> lock(gCommitLock);
+ for(const CommitRecord &r: gCommitRing)if(r.index && r.committedUs<=now && now-r.committedUs<=windowUs)n++;
+ return n;
+}
 static std::mutex gProblemLock;
 static char gLastProblems[2][200];
 static void noteProblem(NSString *what) {
