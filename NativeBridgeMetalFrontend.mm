@@ -292,6 +292,16 @@ static NBTexture *textureOnBuffer(NBBuffer *buffer,MTLTextureDescriptor *d,NSUIn
  NBTexture *texture=[NBTexture new];texture.handle=handle;nmb_texture_describe(handle,&descriptor);texture.descriptor=descriptor;
  texture.buffer=buffer;texture.offset=offset;texture.rowBytes=row;return texture;
 }
+// A texture over a two-plane surface: the runtime reads plane 1 from the surface's own layout (two-plane RGB and YCbCr formats).
+static NBTexture *textureOnSurface(NBBuffer *buffer,MTLTextureDescriptor *d,IOSurfaceRef surface,NSUInteger plane,NSUInteger offset,NSUInteger row) {
+ NmbTextureDescriptor descriptor;if(!buffer || !textureDescriptor(d,&descriptor))return nil;
+ const uint64_t base=(uintptr_t)IOSurfaceGetBaseAddress(surface),chroma=(uintptr_t)IOSurfaceGetBaseAddressOfPlane(surface,1);
+ NmbTexture *handle=nmb_texture_new_on_surface(buffer.handle,&descriptor,offset,row,IOSurfaceGetPixelFormat(surface),plane,
+  IOSurfaceGetWidth(surface),IOSurfaceGetHeight(surface),chroma>=base?chroma-base:0,IOSurfaceGetBytesPerRowOfPlane(surface,1));
+ if(!handle){NBLOG(@"native-metal: texture over surface refused: %@",lastError());return nil;}
+ NBTexture *texture=[NBTexture new];texture.handle=handle;nmb_texture_describe(handle,&descriptor);texture.descriptor=descriptor;
+ texture.buffer=buffer;texture.offset=offset;texture.rowBytes=row;return texture;
+}
 @implementation NBBuffer (Textures)
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d offset:(NSUInteger)offset bytesPerRow:(NSUInteger)row {
  return (id<MTLTexture>)textureOnBuffer(self,d,offset,row,false);
@@ -1370,7 +1380,8 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
  if(start<(uintptr_t)base || start-(uintptr_t)base>=allocation || !row){refuseSurface(3,surface,d,plane,start-(uintptr_t)base,row);return nil;}
  const size_t bytes=(allocation+page-1)&~(page-1);
  NBBuffer *buffer=surfaceBuffer(surface,base,bytes);if(!buffer){refuseSurface(4,surface,d,plane,start-(uintptr_t)base,row);return nil;}
- NBTexture *texture=textureOnBuffer(buffer,d,start-(uintptr_t)base,row,true);if(!texture){refuseSurface(5,surface,d,plane,start-(uintptr_t)base,row);return nil;}
+ NBTexture *texture=planes>=2?textureOnSurface(buffer,d,surface,plane,start-(uintptr_t)base,row):textureOnBuffer(buffer,d,start-(uintptr_t)base,row,true);
+ if(!texture){refuseSurface(5,surface,d,plane,start-(uintptr_t)base,row);return nil;}
  gSurfaceTextures++;texture.surface=(IOSurfaceRef)CFRetain(surface);return (id<MTLTexture>)texture;
 }
 - (id<MTLLibrary>)newLibraryWithData:(dispatch_data_t)data error:(NSError **)error {
@@ -1712,7 +1723,7 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
   std::lock_guard<std::mutex> lock(gProblemLock);
   char formats[160];native_bridge_metal_formats_locked(formats,sizeof formats);row("F %.86s",formats);
   const SurfaceRefusal &r=gSurfaceLastRefusal;
-  if(r.step)row("SR %u %c%c%c%c pl%u/%u o%llx rb%llu a%llx %llux%llu pf%u",r.step,(char)(r.format>>24),(char)(r.format>>16),(char)(r.format>>8),
+  if(r.step)row("SR %u %08x %c%c%c%c pl%u/%u o%llx rb%llu a%llx %llux%llu pf%u",r.step,r.format,(char)(r.format>>24),(char)(r.format>>16),(char)(r.format>>8),
    (char)r.format,r.plane,r.planes,(unsigned long long)r.offset,(unsigned long long)r.row,(unsigned long long)r.allocation,(unsigned long long)r.width,
    (unsigned long long)r.height,r.pixelFormat);
   row("P0 %.86s",gLastProblems[0]);row("P0b %.86s",strlen(gLastProblems[0])>86?gLastProblems[0]+86:"");

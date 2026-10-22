@@ -18,7 +18,7 @@ use metal2vulkan::pipeline::{
 };
 use metal2vulkan_runtime::{
     BinaryArchive, BinaryArchiveDescriptor, BlitCommandEncoder, FamilyRow, FeatureRow, GpuFamily, RowState, BlitOption, Buffer, ClearColor, CommandBuffer, CommandQueue, ComputeCommandEncoder,
-    ComputePipelineState, Deallocator, DebugMessage, DepthStencilState, Device, DeviceOptions, MessageSeverity, MessageSink, Event, EventRef, Fence, Function, Heap, HeapDescriptor, HeapType, HostMemory, IoSurfacePlane, Library, LoadAction,
+    ComputePipelineState, Deallocator, DebugMessage, DepthStencilState, Device, DeviceOptions, MessageSeverity, MessageSink, Event, EventRef, Fence, Function, Heap, HeapDescriptor, HeapType, HostMemory, IoSurfacePlane, IoSurfaceYCbCr, Library, LoadAction,
     MetalLevel, Origin, PipelineOption, PipelineOptions, PurgeableState, PrivateCount, PrivateFlag, PrivateProperties, MAX_COLOR_ATTACHMENTS, Region, RenderCommandEncoder, RenderPassDescriptor, RenderPipelineState, ResourceOptions,
     SamplerState, ScissorRect, SharedEvent, SharedEventListener, Size, StoreAction, Texture, TextureDescriptor, Viewport, VisibilityResultMode,
 };
@@ -738,6 +738,25 @@ pub extern "C" fn nmb_texture_new_on_buffer(buffer: *mut NmbBuffer, descriptor: 
             buffer.new_texture(&descriptor, offset, bytes_per_row)
         };
         Ok(boxed(NmbTexture(texture.map_err(e("texture over buffer"))?)))
+    })
+}
+
+/// `newTextureWithDescriptor:iosurface:plane:` over a surface with planes: `offset` and `bytes_per_row` are the asked plane's, and a
+/// two-plane surface also gives its OSType, the asked plane, its size and plane 1's offset and rows (`chroma`, 0 and 0 for one plane),
+/// which a two-plane texture reads its second plane from.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_texture_new_on_surface(buffer: *mut NmbBuffer, descriptor: *const NmbTextureDescriptor, offset: u64,
+                                             bytes_per_row: u64, pixel_format: u32, plane: u64, width: u64, height: u64,
+                                             chroma_offset: u64, chroma_bytes_per_row: u64) -> *mut NmbTexture {
+    guard(std::ptr::null_mut(), || {
+        let descriptor = texture_descriptor(descriptor)?;
+        let buffer = &get(buffer)?.0;
+        let mut surface = IoSurfacePlane::new(offset, bytes_per_row, true);
+        if chroma_bytes_per_row != 0 {
+            surface = surface.with_ycbcr(IoSurfaceYCbCr::new(pixel_format, plane, [width, height], chroma_offset, chroma_bytes_per_row));
+        }
+        let texture = buffer.new_texture_with_iosurface_plane(&descriptor, surface);
+        Ok(boxed(NmbTexture(texture.map_err(e("texture over surface"))?)))
     })
 }
 
