@@ -30,6 +30,9 @@ extern "C" unsigned native_bridge_metal_recent_commits(uint64_t windowUs);
 - (id<MTLFunction>)nb_newFunctionWithZeroConstants:(NSString *)name;
 @end
 
+// Priming's progress for the telemetry table (the PR row): 1 while a pipeline compiles, libraries done of the list, pipelines made.
+extern "C" {volatile uint32_t native_prime_compiling, native_prime_libraries_done, native_prime_libraries_total, native_prime_made;}
+
 namespace prime {
 static const char *const kRoots[] = {"/System/Library", "/Applications", "/System/Cryptexes/OS/System/Library"};
 
@@ -167,6 +170,7 @@ static std::string library(id<MTLDevice> device, const std::string &path, const 
                 if (type != MTLFunctionTypeKernel && type != MTLFunctionTypeVertex) continue;
                 waited += waitForQuiet();
                 writeCurrent(current, key);
+                native_prime_compiling = 1;
                 bool ok = false;
                 @try {
                     if (type == MTLFunctionTypeKernel) {
@@ -200,7 +204,9 @@ static std::string library(id<MTLDevice> device, const std::string &path, const 
                 } @catch (NSException *exception) {
                     ok = false;
                 }
+                native_prime_compiling = 0;
                 ok ? ++made : ++refused;
+                if (ok) native_prime_made = native_prime_made + 1;
                 if (!ok && firstRefusal.empty()) {
                     NSString *why = error.localizedDescription ?: @"no error";
                     firstRefusal = std::string(" first-refused=") + name.UTF8String + ": " + why.UTF8String;
@@ -238,8 +244,10 @@ static void run(id<MTLDevice> device, std::string root, unsigned delaySeconds, c
     const std::vector<std::string> paths = libraries(listPath, note);
     const std::string build = buildId();
     appendLine(logPath, note + " build=" + build);
+    native_prime_libraries_total = (uint32_t)paths.size();
     for (const std::string &path : paths) {
         ++libs;
+        native_prime_libraries_done = finished;
         struct stat st = {};
         if (stat(path.c_str(), &st) != 0) continue;
         // The plugin's build ends the id: a newer one primes every library again (buildId()).
@@ -250,6 +258,7 @@ static void run(id<MTLDevice> device, std::string root, unsigned delaySeconds, c
         done.insert(id);
         ++finished;
     }
+    native_prime_libraries_done = finished;
     char line[120];
     snprintf(line, sizeof line, "pass libraries=%u finished=%u ms=%llu", libs, finished, (unsigned long long)(nowMs() - began));
     appendLine(logPath, line);
