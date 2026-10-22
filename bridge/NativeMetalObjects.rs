@@ -230,6 +230,25 @@ pub extern "C" fn nmb_device_work_stats(device: *const NmbDevice, out: *mut u64)
     })
 }
 
+/// The device's texture copy counts into the caller's eight words: linear images at Metal's row pitch made, refused by the driver and
+/// refused again from memory, textures given a shadow image, shadow copies in and texels copied back, and passes over linear images
+/// rendered in place and through copies.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_device_texture_counts(device: *const NmbDevice, out: *mut u64) -> bool {
+    guard(false, || {
+        if out.is_null() {
+            return Err("null counts".into());
+        }
+        // SAFETY: the header's eight words.
+        let out = unsafe { std::slice::from_raw_parts_mut(out, 8) };
+        let w = get(device)?.0.work_counts();
+        out.copy_from_slice(&[w.pitched_host_images, w.pitched_host_image_refusals, w.pitched_host_image_refusals_recalled,
+                              w.shadowed_textures, w.shadow_copies, w.shadow_texels_copied_back, w.linear_passes_in_place,
+                              w.linear_passes_through_copies]);
+        Ok(true)
+    })
+}
+
 /// Separate artifact and driver-record counters, mirroring the C ABI.
 #[repr(C)]
 pub struct NmbShaderCacheStats {
