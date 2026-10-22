@@ -1218,7 +1218,15 @@ static bool renderDescriptor(MTLRenderPipelineDescriptor *d,NmbRenderPipelineDes
 @end
 
 // Creation and archive population must use the same complete supported descriptor.
-static bool computeDescriptor(MTLComputePipelineDescriptor *d,NmbComputePipelineDescriptor *p,NSError **error) {
+// The handles of a linked-function list, false for one the frontend did not make.
+static bool linkedHandles(NSArray<id<MTLFunction>> *functions,std::vector<NmbFunction *> &out) {
+ for(id<MTLFunction> f in functions){if(![(id)f isKindOfClass:[NBFunction class]])return false;out.push_back([(NBFunction *)f handle]);}
+ return true;
+}
+
+// The handles `p` points at live in `linked` and `privateLinked`, which outlive its use.
+static bool computeDescriptor(MTLComputePipelineDescriptor *d,NmbComputePipelineDescriptor *p,std::vector<NmbFunction *> &linkedStore,
+                              std::vector<NmbFunction *> &privateStore,NSError **error) {
  if(!d || ![(id)d.computeFunction isKindOfClass:[NBFunction class]]){if(error)*error=nbError(@"foreign compute function");return false;}
  // Metal may materialize empty stage/linked descriptors on access. Preserve the
  // default meaning while refusing state this frontend cannot yet represent.
@@ -1231,10 +1239,14 @@ static bool computeDescriptor(MTLComputePipelineDescriptor *d,NmbComputePipeline
  }
  if(!empty){if(error)*error=nbError(@"compute stage inputs are not implemented");return false;}
  MTLLinkedFunctions *linked=d.linkedFunctions;
- if(linked.functions.count || linked.binaryFunctions.count || linked.privateFunctions.count || linked.groups.count ||
-    d.preloadedLibraries.count || d.insertLibraries.count) {
-  if(error)*error=nbError(@"compute linked/dynamic libraries are not implemented");return false;
+ if(linked.binaryFunctions.count || linked.groups.count || d.preloadedLibraries.count || d.insertLibraries.count) {
+  if(error)*error=nbError(@"compute binary/grouped linked functions and dynamic libraries are not implemented");return false;
  }
+ if(!linkedHandles(linked.functions,linkedStore) || !linkedHandles(linked.privateFunctions,privateStore)) {
+  if(error)*error=nbError(@"foreign linked function");return false;
+ }
+ p->linked=linkedStore.data();p->linked_count=linkedStore.size();
+ p->private_linked=privateStore.data();p->private_linked_count=privateStore.size();
  p->function=[(NBFunction *)d.computeFunction handle];p->max_threads=d.maxTotalThreadsPerThreadgroup;
  p->multiple_of_execution_width=d.threadGroupSizeIsMultipleOfThreadExecutionWidth;p->indirect=d.supportIndirectCommandBuffers;
  p->max_call_stack_depth=d.maxCallStackDepth;p->adding_binary_functions=d.supportAddingBinaryFunctions;
@@ -1256,7 +1268,8 @@ static bool computeDescriptor(MTLComputePipelineDescriptor *d,NmbComputePipeline
  if(error)*error=nil;return YES;
 }
 - (BOOL)addComputePipelineFunctionsWithDescriptor:(MTLComputePipelineDescriptor *)d error:(NSError **)error {
- NmbComputePipelineDescriptor p={};if(!computeDescriptor(d,&p,error))return NO;
+ NmbComputePipelineDescriptor p={};std::vector<NmbFunction *> linked,privateLinked;
+ if(!computeDescriptor(d,&p,linked,privateLinked,error))return NO;
  if(!nmb_binary_archive_add_compute_descriptor(_handle,&p))return failWith<BOOL>(error,@"archive compute pipeline",NO);
  if(error)*error=nil;return YES;
 }
@@ -1440,7 +1453,8 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
 - (id<MTLComputePipelineState>)newComputePipelineStateWithDescriptor:(MTLComputePipelineDescriptor *)d options:(MTLPipelineOption)options
                                                        reflection:(MTLAutoreleasedComputePipelineReflection *)reflection error:(NSError **)error {
  if(reflection)*reflection=nil;
- NmbComputePipelineDescriptor p={};if(!computeDescriptor(d,&p,error))return nil;
+ NmbComputePipelineDescriptor p={};std::vector<NmbFunction *> linked,privateLinked;
+ if(!computeDescriptor(d,&p,linked,privateLinked,error))return nil;
  std::vector<NmbBinaryArchive *> archives;
  if(!pipelineArchives(d.binaryArchives,archives,error))return nil;
  const NmbPipelineOptions creation={(uint64_t)options,archives.data(),archives.size()};
