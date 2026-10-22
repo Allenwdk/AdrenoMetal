@@ -164,6 +164,9 @@ pub unsafe extern "C" fn nmb_device_open(loader: *const c_char, cache: *const c_
         options.metal_level = Some(MetalLevel::NEWEST);
         options.shader_cache = metal2vulkan_runtime::ShaderCacheOptions::in_directory(cache.to_string_lossy().into_owned());
         options.messages = Some(MessageSink::new(observe_message));
+        // A texture over a buffer whose rows lie apart is an image over the bytes, rendered or written too: the window server's padded
+        // framebuffers (3048x2032 BGRA8 at 12288-byte rows, int-251) were otherwise copied in and out of a shadow image every pass.
+        options.policy.padded_reads = metal2vulkan::device::PaddedReadsPolicy::AliasWrites;
         // Every texture given a shadow image is announced with why no image aliases its bytes (`shadow.log`).
         options.announce_each.insert(metal2vulkan_runtime::Degradation::ShadowedTexture);
         let _ = SHADOW_LOG.set(PathBuf::from(cache.to_string_lossy().into_owned()).join("shadow.log"));
