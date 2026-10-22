@@ -68,7 +68,8 @@ static char gFirstProblem[200];
 static void noteProblem(NSString *what) {
  gProblems++;
  std::lock_guard<std::mutex> lock(gProblemLock);
- if(!gFirstProblem[0])strlcpy(gFirstProblem,what.UTF8String?:"?",sizeof gFirstProblem);
+ // A device answer the runtime lacks is reported at creation in every process and is harmless: the first problem is the next one.
+ if(!gFirstProblem[0] && ![what hasPrefix:@"native-metal: no device answer"])strlcpy(gFirstProblem,what.UTF8String?:"?",sizeof gFirstProblem);
  memcpy(gLastProblems[1],gLastProblems[0],sizeof gLastProblems[0]);
  strlcpy(gLastProblems[0],what.UTF8String?:"?",sizeof gLastProblems[0]);
 }

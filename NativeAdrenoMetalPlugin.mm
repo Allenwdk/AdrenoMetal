@@ -201,7 +201,7 @@ static id clientDevice(unsigned port) {
             for (unsigned second = 0; second < 600; ++second) {
                 char problem[200] = {};
                 const uint64_t count = native_bridge_metal_first_problem(problem, sizeof problem);
-                if (count) {clientFailure(port, "problem", problem); return;}
+                if (count && problem[0]) {clientFailure(port, "problem", problem); return;}
                 sleep(1);
             }
         });
