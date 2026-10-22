@@ -13,6 +13,7 @@
 #include <dlfcn.h>
 #include <fts.h>
 #include <mach-o/getsect.h>
+#include <mach-o/loader.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <string.h>
@@ -120,6 +121,27 @@ static uint64_t waitForQuiet() {
     }
 }
 
+// The plugin's own build (its Mach-O LC_UUID), which ends each finished library's id: a new runtime may no longer find the pipelines an
+// earlier one cached (int-246: after a runtime change the Vulkan cache had 0 hits and 214 misses, while prime-done still listed every
+// library), so a new build primes every library again; what is still cached then costs only a cache hit.
+static std::string buildId() {
+    Dl_info info = {};
+    if (!dladdr(reinterpret_cast<const void *>(&buildId), &info) || !info.dli_fbase) return "unknown";
+    const auto *header = static_cast<const mach_header_64 *>(info.dli_fbase);
+    if (header->magic != MH_MAGIC_64) return "unknown";
+    const auto *command = reinterpret_cast<const load_command *>(header + 1);
+    for (uint32_t i = 0; i < header->ncmds; ++i) {
+        if (command->cmd == LC_UUID) {
+            const uint8_t *uuid = reinterpret_cast<const uuid_command *>(command)->uuid;
+            char text[33];
+            for (int k = 0; k < 16; ++k) snprintf(text + 2 * k, 3, "%02x", uuid[k]);
+            return text;
+        }
+        command = reinterpret_cast<const load_command *>(reinterpret_cast<const uint8_t *>(command) + command->cmdsize);
+    }
+    return "unknown";
+}
+
 // One library: every function it names, in its order; returns the log line.
 static std::string library(id<MTLDevice> device, const std::string &path, const std::string &current, const std::set<std::string> &bad) {
     unsigned kernels = 0, renders = 0, made = 0, refused = 0, skipped = 0;
@@ -195,13 +217,14 @@ static void run(id<MTLDevice> device, std::string root, unsigned delaySeconds, c
     unsigned libs = 0, finished = 0;
     std::string note;
     const std::vector<std::string> paths = libraries(listPath, note);
-    appendLine(logPath, note);
+    const std::string build = buildId();
+    appendLine(logPath, note + " build=" + build);
     for (const std::string &path : paths) {
         ++libs;
         struct stat st = {};
         if (stat(path.c_str(), &st) != 0) continue;
-        // The pass version ends the id: a newer one primes every library again (its refusals may be fixed, and their reasons get logged).
-        const std::string id = path + "\t" + std::to_string((long long)st.st_size) + "\t" + std::to_string((long long)st.st_mtimespec.tv_sec) + "\tv2";
+        // The plugin's build ends the id: a newer one primes every library again (buildId()).
+        const std::string id = path + "\t" + std::to_string((long long)st.st_size) + "\t" + std::to_string((long long)st.st_mtimespec.tv_sec) + "\t" + build;
         if (done.count(id)) {++finished; continue;}
         appendLine(logPath, library(device, path, current, bad));
         appendLine(donePath, id);
