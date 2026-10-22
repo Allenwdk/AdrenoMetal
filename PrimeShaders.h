@@ -26,6 +26,10 @@
 
 extern "C" unsigned native_bridge_metal_recent_commits(uint64_t windowUs);
 
+@interface NSObject (NBPrimeZeroConstants)
+- (id<MTLFunction>)nb_newFunctionWithZeroConstants:(NSString *)name;
+@end
+
 namespace prime {
 static const char *const kRoots[] = {"/System/Library", "/Applications", "/System/Cryptexes/OS/System/Library"};
 
@@ -144,7 +148,7 @@ static std::string buildId() {
 
 // One library: every function it names, in its order; returns the log line.
 static std::string library(id<MTLDevice> device, const std::string &path, const std::string &current, const std::set<std::string> &bad) {
-    unsigned kernels = 0, renders = 0, made = 0, refused = 0, skipped = 0;
+    unsigned kernels = 0, renders = 0, made = 0, refused = 0, skipped = 0, zeroed = 0;
     uint64_t waited = 0;
     std::string firstRefusal;   // the first refused function and why, so the log tells translator gaps from unspecialized constants
     const uint64_t began = nowMs();
@@ -168,14 +172,29 @@ static std::string library(id<MTLDevice> device, const std::string &path, const 
                     if (type == MTLFunctionTypeKernel) {
                         ++kernels;
                         ok = [device newComputePipelineStateWithFunction:function error:&error] != nil;
+                        // A kernel that uses a function constant's value needs one: prime the variant with every constant zero, which
+                        // still takes the module through translation and the driver (int-245: 2901 kernels refused for want of one).
+                        if (!ok && [error.localizedDescription containsString:@"FunctionConstant"] &&
+                            [lib respondsToSelector:@selector(nb_newFunctionWithZeroConstants:)]) {
+                            id<MTLFunction> zero = [(NSObject *)lib nb_newFunctionWithZeroConstants:name];
+                            if (zero) {error = nil; ok = [device newComputePipelineStateWithFunction:zero error:&error] != nil; if (ok) ++zeroed;}
+                        }
                     } else {
                         ++renders;
                         MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
                         d.vertexFunction = function;
-                        NSString *fragment = [name stringByReplacingOccurrencesOfString:@"_vert_" withString:@"_frag_"];
-                        if (![fragment isEqualToString:name] && [names containsObject:fragment]) d.fragmentFunction = [lib newFunctionWithName:fragment];
-                        if (!d.fragmentFunction) d.rasterizationEnabled = NO;
-                        else d.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+                        d.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+                        // The fragment function of the same stem under the libraries' usual spellings; without one the pipeline still
+                        // rasterizes (Metal refuses an unrasterized pipeline whose vertex function returns a position, int-245: 732 refusals).
+                        static NSString *const kPairs[][2] = {{@"_vert_", @"_frag_"}, {@"_vertex", @"_fragment"}, {@"Vertex", @"Fragment"},
+                                                              {@"vertex", @"fragment"}, {@"_vs", @"_fs"}, {@"_vert", @"_frag"}, {@"VS", @"PS"}};
+                        for (const auto &pair : kPairs) {
+                            NSString *fragment = [name stringByReplacingOccurrencesOfString:pair[0] withString:pair[1]];
+                            if (![fragment isEqualToString:name] && [names containsObject:fragment]) {
+                                d.fragmentFunction = [lib newFunctionWithName:fragment];
+                                if (d.fragmentFunction) break;
+                            }
+                        }
                         ok = [device newRenderPipelineStateWithDescriptor:d error:&error] != nil;
                     }
                 } @catch (NSException *exception) {
@@ -196,8 +215,8 @@ static std::string library(id<MTLDevice> device, const std::string &path, const 
     }
     unlink(current.c_str());
     char line[180];
-    snprintf(line, sizeof line, " kernels=%u renders=%u made=%u refused=%u skipped=%u ms=%llu waited=%llu", kernels, renders, made, refused,
-             skipped, (unsigned long long)(nowMs() - began), (unsigned long long)waited);
+    snprintf(line, sizeof line, " kernels=%u renders=%u made=%u zeroed=%u refused=%u skipped=%u ms=%llu waited=%llu", kernels, renders, made,
+             zeroed, refused, skipped, (unsigned long long)(nowMs() - began), (unsigned long long)waited);
     return path + line + firstRefusal;
 }
 

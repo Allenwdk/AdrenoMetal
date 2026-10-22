@@ -1008,6 +1008,49 @@ pub unsafe extern "C" fn nmb_function_new_specialized(library: *mut NmbLibrary, 
     })
 }
 
+/// Bytes of a function constant's `MTLDataType` (scalars and 2- and 4-wide vectors), 0 for a type that is not given a value.
+fn constant_bytes(raw: u32) -> usize {
+    match raw {
+        53 | 45 | 49 => 1,
+        16 | 46 | 50 | 54 => 2,
+        3 | 29 | 33 | 17 | 38 | 42 | 48 | 52 | 56 => 4,
+        4 | 30 | 34 | 19 | 40 | 44 | 81 | 85 => 8,
+        6 | 32 | 36 | 82 | 86 => 16,
+        84 | 88 => 32,
+        _ => 0,
+    }
+}
+
+/// The library's function `name` with every function constant it declares set to zero (false for a bool), for shader priming: a
+/// function whose code uses a constant's value is otherwise refused (`NeedsInput(FunctionConstant)`), and this variant still takes its
+/// module through decoding, translation and the driver. Null when a constant's type takes no value.
+///
+/// # Safety
+/// `name` is a C string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nmb_function_new_zero_constants(library: *mut NmbLibrary, name: *const c_char) -> *mut NmbFunction {
+    guard(std::ptr::null_mut(), || {
+        if name.is_null() {
+            return Err("null function name".into());
+        }
+        // SAFETY: the caller's contract.
+        let name = unsafe { CStr::from_ptr(name) }.to_str().map_err(e("function name"))?;
+        let library = &get(library)?.0;
+        let generic = library.new_function_with_name(name).map_err(e("function"))?;
+        let mut values = FunctionConstantValues::defaults();
+        for (key, constant) in generic.function_constants_dictionary().map_err(e("function constants"))? {
+            let ty = constant.data_type();
+            let bytes = constant_bytes(ty.as_raw());
+            if bytes == 0 {
+                return Err(format!("function constant {key} of type {}", ty.as_raw()));
+            }
+            values.by_index.insert(constant.index(), FunctionConstantValue::new(ty, vec![0; bytes]));
+        }
+        let function = library.new_function_with_name_constant_values(name, &values).map_err(e("zero-specialized function"))?;
+        Ok(boxed(NmbFunction(function)))
+    })
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn nmb_function_release(function: *mut NmbFunction) {
     release(function)

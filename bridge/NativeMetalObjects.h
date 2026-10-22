@@ -118,6 +118,8 @@ NmbFunction *nmb_function_new(NmbLibrary *, const char *name);
  * indexed value; bytes holds the value's bytes. */
 struct NmbConstant {uint64_t type, index; const char *name; const void *bytes; uint64_t length;};
 NmbFunction *nmb_function_new_specialized(NmbLibrary *, const char *name, const struct NmbConstant *constants, uint32_t count);
+// The library's function with every function constant it declares set to zero (shader priming), or null.
+NmbFunction *nmb_function_new_zero_constants(NmbLibrary *, const char *name);
 void nmb_function_release(NmbFunction *);
 /* Metal's MTLFunctionType (1 vertex, 2 fragment, 3 kernel, ...). */
 uint64_t nmb_function_type(const NmbFunction *);
