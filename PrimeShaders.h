@@ -23,6 +23,8 @@
 #include <string>
 #include <vector>
 
+extern "C" unsigned native_bridge_metal_recent_commits(uint64_t windowUs);
+
 namespace prime {
 static const char *const kRoots[] = {"/System/Library", "/Applications", "/System/Cryptexes/OS/System/Library"};
 
@@ -100,9 +102,28 @@ static std::vector<std::string> libraries(const std::string &listPath, std::stri
     return found;
 }
 
+// Waits until the render server is not animating: more than 12 command buffers in 250 ms (an idle desktop redraws at about 12 fps, a swipe
+// commits 25 or more) means frames are being drawn, and a pipeline compile then competes with them for the CPU and the driver (int-244:
+// priming during the scripted swipes raised the median frame interval from 19 to 30 ms). Returns the milliseconds it waited.
+static uint64_t waitForQuiet() {
+    const uint64_t began = nowMs();
+    uint64_t quietSince = 0;
+    bool busy = false;
+    for (;;) {
+        const uint64_t now = nowMs();
+        if (native_bridge_metal_recent_commits(250000) > 12) {busy = true; quietSince = 0;}
+        else if (!busy) return 0;
+        else if (!quietSince) quietSince = now;
+        // After animation, a second without it before the next compile, so a pause between two swipes does not let one in.
+        else if (now - quietSince >= 1000) return now - began;
+        usleep(100000);
+    }
+}
+
 // One library: every function it names, in its order; returns the log line.
 static std::string library(id<MTLDevice> device, const std::string &path, const std::string &current, const std::set<std::string> &bad) {
     unsigned kernels = 0, renders = 0, made = 0, refused = 0, skipped = 0;
+    uint64_t waited = 0;
     std::string firstRefusal;   // the first refused function and why, so the log tells translator gaps from unspecialized constants
     const uint64_t began = nowMs();
     @autoreleasepool {
@@ -118,6 +139,7 @@ static std::string library(id<MTLDevice> device, const std::string &path, const 
                 if (!function) {++refused; continue;}
                 const MTLFunctionType type = function.functionType;
                 if (type != MTLFunctionTypeKernel && type != MTLFunctionTypeVertex) continue;
+                waited += waitForQuiet();
                 writeCurrent(current, key);
                 bool ok = false;
                 @try {
@@ -151,9 +173,9 @@ static std::string library(id<MTLDevice> device, const std::string &path, const 
         }
     }
     unlink(current.c_str());
-    char line[160];
-    snprintf(line, sizeof line, " kernels=%u renders=%u made=%u refused=%u skipped=%u ms=%llu", kernels, renders, made, refused, skipped,
-             (unsigned long long)(nowMs() - began));
+    char line[180];
+    snprintf(line, sizeof line, " kernels=%u renders=%u made=%u refused=%u skipped=%u ms=%llu waited=%llu", kernels, renders, made, refused,
+             skipped, (unsigned long long)(nowMs() - began), (unsigned long long)waited);
     return path + line + firstRefusal;
 }
 
