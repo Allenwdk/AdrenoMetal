@@ -439,6 +439,13 @@ static std::string quartzCoreCallers();
  NBFunction *function=[NBFunction new];function.handle=handle;function.name=name;function.functionType=(MTLFunctionType)nmb_function_type(handle);
  return (id<MTLFunction>)function;
 }
+// Shader priming (PrimeShaders.h): the function with each of its function constants set to zero, or nil.
+- (id<MTLFunction>)nb_newFunctionWithZeroConstants:(NSString *)name {
+ NmbFunction *handle=name?nmb_function_new_zero_constants(_handle,name.UTF8String):nullptr;
+ if(!handle)return nil;
+ NBFunction *function=[NBFunction new];function.handle=handle;function.name=name;function.functionType=(MTLFunctionType)nmb_function_type(handle);
+ return (id<MTLFunction>)function;
+}
 @end
 @interface NBComputePipeline : NBObject
 @property(nonatomic) NmbComputePipeline *handle;
