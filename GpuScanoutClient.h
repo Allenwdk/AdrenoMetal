@@ -81,7 +81,7 @@ public:
         note(0x6730);   // a frame was offered
         const uint64_t began = mach_absolute_time();
         const gpupresent::Result r = presenter_->present({(const void *)(uintptr_t)swap.address, (size_t)((swap.bytes + page - 1) & ~(page - 1)),
-                                                          (size_t)swap.stride, swap.width, swap.height});
+                                                          (size_t)swap.stride, swap.width, swap.height, swap.reserved});
         {
             static mach_timebase_info_data_t base;
             if (!base.denom) mach_timebase_info(&base);

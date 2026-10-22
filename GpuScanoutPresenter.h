@@ -23,6 +23,7 @@ struct Frame {
     size_t bytes;     // allocation size, a multiple of the page size
     size_t stride;
     uint32_t width, height;
+    uint32_t mapping; // the kernel's id for this mapping of the surface (0: none, imported for this frame only)
 };
 
 enum Result { kOk = 0, kBadFrame, kBadScanout, kNoResource, kGpuFailed };
@@ -42,7 +43,7 @@ public:
         if (!frame.base || ((uintptr_t)frame.base & (page - 1)) || !frame.bytes || (frame.bytes & (page - 1)) ||
             frame.width != scanout_.width || frame.height != scanout_.height || frame.stride < row ||
             (size_t)frame.height > frame.bytes / frame.stride || frame.stride * (frame.height - 1) + row > frame.bytes) return kBadFrame;
-        id<MTLBuffer> source = [device_ newBufferWithBytesNoCopy:(void *)frame.base length:frame.bytes options:MTLResourceStorageModeShared deallocator:nil];
+        id<MTLBuffer> source = sourceFor(frame);
         if (!source) return kNoResource;
         id<MTLCommandBuffer> commands = [queue_ commandBuffer];
         id<MTLBlitCommandEncoder> blit = commands ? [commands blitCommandEncoder] : nil;
@@ -73,6 +74,24 @@ public:
         return commands.status == MTLCommandBufferStatusCompleted ? kOk : kGpuFailed;
     }
 private:
+    // The compositor cycles through a few surfaces and the kernel keeps each one's mapping under one id, so the GPU import (pinning and
+    // mapping the pages, milliseconds per frame otherwise) is made once per surface. The kernel keeps more mappings (6) than kSources, so
+    // every import cached here still has its mapping.
+    static constexpr unsigned kSources = 4;
+    struct Source { uint32_t mapping; const void *base; size_t bytes; uint64_t used; id<MTLBuffer> buffer; };
+    id<MTLBuffer> sourceFor(const Frame &frame) {
+        if (!frame.mapping)
+            return [device_ newBufferWithBytesNoCopy:(void *)frame.base length:frame.bytes options:MTLResourceStorageModeShared deallocator:nil];
+        unsigned victim = 0;
+        for (unsigned i = 0; i < kSources; ++i) {
+            Source &s = sources_[i];
+            if (s.buffer && s.mapping == frame.mapping && s.base == frame.base && s.bytes == frame.bytes) {s.used = ++uses_; return s.buffer;}
+            if (!sources_[i].buffer || sources_[i].used < sources_[victim].used) victim = i;
+        }
+        id<MTLBuffer> buffer = [device_ newBufferWithBytesNoCopy:(void *)frame.base length:frame.bytes options:MTLResourceStorageModeShared deallocator:nil];
+        if (buffer) sources_[victim] = {frame.mapping, frame.base, frame.bytes, ++uses_, buffer};
+        return buffer;
+    }
     bool validScanout() const {
         const size_t page = (size_t)getpagesize();
         return scanout_.base && !((uintptr_t)scanout_.base & (page - 1)) && scanout_.bytes && !(scanout_.bytes & (page - 1)) &&
@@ -83,6 +102,8 @@ private:
     Scanout scanout_;
     id<MTLCommandQueue> queue_;
     id<MTLBuffer> target_;
+    Source sources_[kSources] = {};
+    uint64_t uses_ = 0;
 };
 
 }  // namespace gpupresent
