@@ -74,6 +74,16 @@ static void noteProblem(NSString *what) {
 static uint32_t gFormats[8];static unsigned gFormatCount;static std::atomic<uint64_t> gTextureRefusals;
 // Textures over IOSurfaces: made, refused, and how many of the requests named a planar surface.
 static std::atomic<uint64_t> gSurfaceTextures,gSurfaceRefusals,gSurfacePlanar;
+// The last refused surface texture: the check that refused it (1 plane, 2 base, 3 plane range, 4 import, 5 texture), the surface's format,
+// planes, requested plane, plane offset, plane row bytes and allocation, and the descriptor's size and pixel format.
+struct SurfaceRefusal {uint32_t step,format,planes,plane,pixelFormat;uint64_t offset,row,allocation,width,height;};
+static SurfaceRefusal gSurfaceLastRefusal;
+static void refuseSurface(uint32_t step,IOSurfaceRef surface,MTLTextureDescriptor *d,NSUInteger plane,uint64_t offset,uint64_t row) {
+ gSurfaceRefusals++;
+ SurfaceRefusal r={step,surface?IOSurfaceGetPixelFormat(surface):0,surface?(uint32_t)IOSurfaceGetPlaneCount(surface):0,(uint32_t)plane,
+                   d?(uint32_t)d.pixelFormat:0,offset,row,surface?IOSurfaceGetAllocSize(surface):0,d?d.width:0,d?d.height:0};
+ std::lock_guard<std::mutex> lock(gProblemLock);gSurfaceLastRefusal=r;
+}
 static void noteFormat(uint32_t format,bool made) {
  std::lock_guard<std::mutex> lock(gProblemLock);
  if(!made)gTextureRefusals++;
@@ -1358,16 +1368,16 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
  // A planar surface (Apple's lossless-compressed BGRA spelling has one plane, video formats two) is imported whole; the texture starts at
  // the plane's own address and rows. Only a plain surface has no planes, and then only plane 0 exists.
  const size_t planes=surface?IOSurfaceGetPlaneCount(surface):0;
- if(!surface || !d || (planes?plane>=planes:plane!=0)){gSurfaceRefusals++;return nil;}
+ if(!surface || !d || (planes?plane>=planes:plane!=0)){refuseSurface(1,surface,d,plane,0,0);return nil;}
  if(planes)gSurfacePlanar++;
  void *base=IOSurfaceGetBaseAddress(surface);const size_t page=(size_t)getpagesize(),allocation=IOSurfaceGetAllocSize(surface);
- if(!page || (page&(page-1)) || !base || ((uintptr_t)base&(page-1)) || !allocation || allocation>SIZE_MAX-(page-1)){gSurfaceRefusals++;return nil;}
+ if(!page || (page&(page-1)) || !base || ((uintptr_t)base&(page-1)) || !allocation || allocation>SIZE_MAX-(page-1)){refuseSurface(2,surface,d,plane,(uintptr_t)base,0);return nil;}
  const uintptr_t start=planes?(uintptr_t)IOSurfaceGetBaseAddressOfPlane(surface,plane):(uintptr_t)base;
  const size_t row=planes?IOSurfaceGetBytesPerRowOfPlane(surface,plane):IOSurfaceGetBytesPerRow(surface);
- if(start<(uintptr_t)base || start-(uintptr_t)base>=allocation || !row){gSurfaceRefusals++;return nil;}
+ if(start<(uintptr_t)base || start-(uintptr_t)base>=allocation || !row){refuseSurface(3,surface,d,plane,start-(uintptr_t)base,row);return nil;}
  const size_t bytes=(allocation+page-1)&~(page-1);
- NBBuffer *buffer=surfaceBuffer(surface,base,bytes);if(!buffer){gSurfaceRefusals++;return nil;}
- NBTexture *texture=textureOnBuffer(buffer,d,start-(uintptr_t)base,row,true);if(!texture){gSurfaceRefusals++;return nil;}
+ NBBuffer *buffer=surfaceBuffer(surface,base,bytes);if(!buffer){refuseSurface(4,surface,d,plane,start-(uintptr_t)base,row);return nil;}
+ NBTexture *texture=textureOnBuffer(buffer,d,start-(uintptr_t)base,row,true);if(!texture){refuseSurface(5,surface,d,plane,start-(uintptr_t)base,row);return nil;}
  gSurfaceTextures++;texture.surface=(IOSurfaceRef)CFRetain(surface);return (id<MTLTexture>)texture;
 }
 - (id<MTLLibrary>)newLibraryWithData:(dispatch_data_t)data error:(NSError **)error {
@@ -1708,6 +1718,10 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
  {
   std::lock_guard<std::mutex> lock(gProblemLock);
   char formats[160];native_bridge_metal_formats_locked(formats,sizeof formats);row("F %.86s",formats);
+  const SurfaceRefusal &r=gSurfaceLastRefusal;
+  if(r.step)row("SR %u %c%c%c%c pl%u/%u o%llx rb%llu a%llx %llux%llu pf%u",r.step,(char)(r.format>>24),(char)(r.format>>16),(char)(r.format>>8),
+   (char)r.format,r.plane,r.planes,(unsigned long long)r.offset,(unsigned long long)r.row,(unsigned long long)r.allocation,(unsigned long long)r.width,
+   (unsigned long long)r.height,r.pixelFormat);
   row("P0 %.86s",gLastProblems[0]);row("P0b %.86s",strlen(gLastProblems[0])>86?gLastProblems[0]+86:"");
   row("P1 %.86s",gLastProblems[1]);row("P1b %.86s",strlen(gLastProblems[1])>86?gLastProblems[1]+86:"");
  }
