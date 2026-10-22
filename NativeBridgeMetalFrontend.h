@@ -15,6 +15,8 @@ id native_bridge_metal_library_with_air(const void *bytes, size_t length);
 size_t native_bridge_metal_status(char *out, size_t size);
 // The pixel formats of the textures asked for (first eight distinct) and how many texture requests the runtime refused.
 size_t native_bridge_metal_formats(char *out, size_t size);
+// The process's first problem (a refusal or a missing call) into out, and how many problems there were.
+uint64_t native_bridge_metal_first_problem(char *out, size_t size);
 size_t native_bridge_metal_telemetry(char *out, size_t size);
 // Structured cumulative artifact/driver-cache counters for offline qualification.
 struct NmbShaderCacheStats;
