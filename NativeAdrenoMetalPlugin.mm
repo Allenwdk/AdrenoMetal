@@ -17,6 +17,7 @@
 #include "NativeAdrenoUserTest.h"
 #include "NativeMetalBridgePhase.h"
 #include "CacheExport.h"
+#include "PrimeShaders.h"
 #include "ExceptionDiag.h"
 
 @interface _MTLDevice : NSObject
@@ -361,6 +362,14 @@ static id deviceForPort(unsigned port) {
             cacheexport::run(*static_cast<Gpu *>(arg), gCacheDirectory);
             return nullptr;
         }, gpu);
+        // Every Metal library of the OS through the runtime, three minutes after the desktop came up (PrimeShaders.h).
+        // The translator recurses deeply on large functions: give it the stack of a main thread.
+        pthread_attr_setstacksize(&attributes, 8u << 20);
+        pthread_t primer;
+        pthread_create(&primer, &attributes, [](void *) -> void * {
+            prime::run((id<MTLDevice>)device, gCacheDirectory, 180);
+            return nullptr;
+        }, nullptr);
         pthread_attr_destroy(&attributes);
         gpu->mark(0x6803);
         return device;
