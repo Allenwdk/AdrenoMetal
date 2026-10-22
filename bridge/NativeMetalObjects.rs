@@ -233,6 +233,13 @@ fn observe_message(message: &DebugMessage) {
     }
 }
 
+/// The translator source the runtime was built from (its pin and recorded patches, `build-native-metal-bridge.py`), which keys the shader
+/// cache, as a C string.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_runtime_build() -> *const c_char {
+    concat!(env!("NMB_RUNTIME_ID"), "\0").as_ptr().cast()
+}
+
 /// The sink's counts into the caller's ten words: pipeline makings (count, total us, longest us, waited us, failed), messages (info,
 /// warning or worse), and the device's shader cache hits, misses and writes.
 #[unsafe(no_mangle)]

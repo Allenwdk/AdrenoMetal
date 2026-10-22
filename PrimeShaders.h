@@ -12,6 +12,7 @@
 #import <Metal/Metal.h>
 #include <dlfcn.h>
 #include <fts.h>
+#include <mach-o/dyld.h>
 #include <mach-o/getsect.h>
 #include <mach-o/loader.h>
 #include <pthread.h>
@@ -110,43 +111,56 @@ static std::vector<std::string> libraries(const std::string &listPath, std::stri
     return found;
 }
 
-// Waits until the render server is not animating: more than 12 command buffers in 250 ms (an idle desktop redraws at about 12 fps, a swipe
-// commits 25 or more) means frames are being drawn, and a pipeline compile then competes with them for the CPU and the driver (int-244:
-// priming during the scripted swipes raised the median frame interval from 19 to 30 ms). Returns the milliseconds it waited.
+// Waits until the render server is not animating: more than 4 command buffers in 250 ms (16 fps; an idle desktop redraws at about 12 fps)
+// means frames are being drawn, and a pipeline compile then competes with them for the CPU and the driver (int-244: priming during the
+// scripted swipes raised the median frame interval from 19 to 30 ms). A higher bar let compiles in once they had slowed the frames under
+// it (int-250: 12 per 250 ms, 460 pipelines made during the swipes at a 48 ms median). Returns the milliseconds it waited.
 static uint64_t waitForQuiet() {
     const uint64_t began = nowMs();
     uint64_t quietSince = 0;
     bool busy = false;
     for (;;) {
         const uint64_t now = nowMs();
-        if (native_bridge_metal_recent_commits(250000) > 12) {busy = true; quietSince = 0;}
+        if (native_bridge_metal_recent_commits(250000) > 4) {busy = true; quietSince = 0;}
         else if (!busy) return 0;
         else if (!quietSince) quietSince = now;
-        // After animation, a second without it before the next compile, so a pause between two swipes does not let one in.
-        else if (now - quietSince >= 1000) return now - began;
+        // After animation, two seconds without it before the next compile, so a pause between two swipes does not let one in.
+        else if (now - quietSince >= 2000) return now - began;
         usleep(100000);
     }
 }
 
-// The plugin's own build (its Mach-O LC_UUID), which ends each finished library's id: a new runtime may no longer find the pipelines an
-// earlier one cached (int-246: after a runtime change the Vulkan cache had 0 hits and 214 misses, while prime-done still listed every
-// library), so a new build primes every library again; what is still cached then costs only a cache hit.
-static std::string buildId() {
-    Dl_info info = {};
-    if (!dladdr(reinterpret_cast<const void *>(&buildId), &info) || !info.dli_fbase) return "unknown";
-    const auto *header = static_cast<const mach_header_64 *>(info.dli_fbase);
-    if (header->magic != MH_MAGIC_64) return "unknown";
-    const auto *command = reinterpret_cast<const load_command *>(header + 1);
-    for (uint32_t i = 0; i < header->ncmds; ++i) {
-        if (command->cmd == LC_UUID) {
-            const uint8_t *uuid = reinterpret_cast<const uuid_command *>(command)->uuid;
-            char text[33];
-            for (int k = 0; k < 16; ++k) snprintf(text + 2 * k, 3, "%02x", uuid[k]);
-            return text;
+extern "C" const char *nmb_runtime_build(void);
+
+// The LC_UUID of the loaded image whose path ends in `suffix`, "unknown" without one.
+static std::string imageUuid(const char *suffix) {
+    for (uint32_t index = 0; index < _dyld_image_count(); ++index) {
+        const char *name = _dyld_get_image_name(index);
+        const size_t length = strlen(name), want = strlen(suffix);
+        if (length < want || strcmp(name + length - want, suffix) != 0) continue;
+        const auto *header = reinterpret_cast<const mach_header_64 *>(_dyld_get_image_header(index));
+        if (!header || header->magic != MH_MAGIC_64) break;
+        const auto *command = reinterpret_cast<const load_command *>(header + 1);
+        for (uint32_t i = 0; i < header->ncmds; ++i) {
+            if (command->cmd == LC_UUID) {
+                const uint8_t *uuid = reinterpret_cast<const uuid_command *>(command)->uuid;
+                char text[33];
+                for (int k = 0; k < 16; ++k) snprintf(text + 2 * k, 3, "%02x", uuid[k]);
+                return text;
+            }
+            command = reinterpret_cast<const load_command *>(reinterpret_cast<const uint8_t *>(command) + command->cmdsize);
         }
-        command = reinterpret_cast<const load_command *>(reinterpret_cast<const uint8_t *>(command) + command->cmdsize);
+        break;
     }
     return "unknown";
+}
+
+// What the cached pipelines were made by, which ends each finished library's id: the runtime's translator source, which keys the shader
+// cache (int-246: after a runtime change the Vulkan cache had 0 hits and 214 misses, while prime-done still listed every library), and
+// Turnip's build, which keys its pipeline cache (int-249: 4099 misses after a Turnip rebuild). A change of either primes every library
+// again; a plugin rebuild alone keeps what was finished.
+static std::string buildId() {
+    return std::string(nmb_runtime_build()) + "-" + imageUuid("/libvulkan_freedreno.dylib");
 }
 
 // A kernel that calls visible functions it does not define (`NeedsInput(LinkedFunction { symbol: "..." })`): link the library's function of
@@ -283,7 +297,7 @@ static void run(id<MTLDevice> device, std::string root, unsigned delaySeconds, c
         native_prime_libraries_done = finished;
         struct stat st = {};
         if (stat(path.c_str(), &st) != 0) continue;
-        // The plugin's build ends the id: a newer one primes every library again (buildId()).
+        // The runtime's and Turnip's builds end the id: a newer one primes every library again (buildId()).
         const std::string id = path + "\t" + std::to_string((long long)st.st_size) + "\t" + std::to_string((long long)st.st_mtimespec.tv_sec) + "\t" + build;
         if (done.count(id)) {++finished; continue;}
         appendLine(logPath, library(device, path, current, bad));
