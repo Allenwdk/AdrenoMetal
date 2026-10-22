@@ -39,6 +39,8 @@ size_t nmb_device_name(const NmbDevice *, char *out, size_t size);
 uint64_t nmb_device_max_buffer_length(const NmbDevice *);
 // Pipeline makings (count, total us, longest us, waited us, failed), sink messages (info, warning+), shader cache hits/misses/writes.
 bool nmb_device_work_stats(const NmbDevice *, uint64_t out[10]);
+// Linear images made/refused/refused again, shadowed textures, shadow copies, texels copied back, linear passes in place/through copies.
+bool nmb_device_texture_counts(const NmbDevice *, uint64_t out[8]);
 /* Artifact lookups and driver pipeline records are separate cache layers. */
 struct NmbShaderCacheStats {
     uint64_t hits, misses, rejected, read_failures, writes, write_failures, evictions;
