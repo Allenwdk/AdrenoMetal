@@ -103,6 +103,7 @@ static std::vector<std::string> libraries(const std::string &listPath, std::stri
 // One library: every function it names, in its order; returns the log line.
 static std::string library(id<MTLDevice> device, const std::string &path, const std::string &current, const std::set<std::string> &bad) {
     unsigned kernels = 0, renders = 0, made = 0, refused = 0, skipped = 0;
+    std::string firstRefusal;   // the first refused function and why, so the log tells translator gaps from unspecialized constants
     const uint64_t began = nowMs();
     @autoreleasepool {
         NSError *error = nil;
@@ -137,6 +138,13 @@ static std::string library(id<MTLDevice> device, const std::string &path, const 
                     ok = false;
                 }
                 ok ? ++made : ++refused;
+                if (!ok && firstRefusal.empty()) {
+                    NSString *why = error.localizedDescription ?: @"no error";
+                    firstRefusal = std::string(" first-refused=") + name.UTF8String + ": " + why.UTF8String;
+                    if (firstRefusal.size() > 220) firstRefusal.resize(220);
+                    for (char &c : firstRefusal) if (c == '\n' || c == '\t') c = ' ';
+                }
+                error = nil;
                 // Low priority already; a short pause between pipelines keeps the render server's own work ahead.
                 usleep(20000);
             }
@@ -146,7 +154,7 @@ static std::string library(id<MTLDevice> device, const std::string &path, const 
     char line[160];
     snprintf(line, sizeof line, " kernels=%u renders=%u made=%u refused=%u skipped=%u ms=%llu", kernels, renders, made, refused, skipped,
              (unsigned long long)(nowMs() - began));
-    return path + line;
+    return path + line + firstRefusal;
 }
 
 // The thread: waits for the desktop to settle, then works through the libraries not finished yet.
@@ -170,7 +178,8 @@ static void run(id<MTLDevice> device, std::string root, unsigned delaySeconds, c
         ++libs;
         struct stat st = {};
         if (stat(path.c_str(), &st) != 0) continue;
-        const std::string id = path + "\t" + std::to_string((long long)st.st_size) + "\t" + std::to_string((long long)st.st_mtimespec.tv_sec);
+        // The pass version ends the id: a newer one primes every library again (its refusals may be fixed, and their reasons get logged).
+        const std::string id = path + "\t" + std::to_string((long long)st.st_size) + "\t" + std::to_string((long long)st.st_mtimespec.tv_sec) + "\tv2";
         if (done.count(id)) {++finished; continue;}
         appendLine(logPath, library(device, path, current, bad));
         appendLine(donePath, id);
