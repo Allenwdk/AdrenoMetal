@@ -13,7 +13,7 @@ use metal2vulkan::metal::{
     TextureUsage, TriangleFillMode, VertexFormat, VertexStepFunction, Winding,
 };
 use metal2vulkan::pipeline::{
-    ColorAttachmentDescriptor, ComputePipelineDescriptor, RenderPipelineDescriptor, StageSource, VertexAttributeDescriptor, VertexBufferLayoutDescriptor,
+    ColorAttachmentDescriptor, ComputePipelineDescriptor, LinkedFunction, LinkedFunctions, RenderPipelineDescriptor, StageSource, VertexAttributeDescriptor, VertexBufferLayoutDescriptor,
     VertexDescriptor,
 };
 use metal2vulkan_runtime::{
@@ -164,6 +164,9 @@ pub unsafe extern "C" fn nmb_device_open(loader: *const c_char, cache: *const c_
         options.metal_level = Some(MetalLevel::NEWEST);
         options.shader_cache = metal2vulkan_runtime::ShaderCacheOptions::in_directory(cache.to_string_lossy().into_owned());
         options.messages = Some(MessageSink::new(observe_message));
+        // Every texture given a shadow image is announced with why no image aliases its bytes (`shadow.log`).
+        options.announce_each.insert(metal2vulkan_runtime::Degradation::ShadowedTexture);
+        let _ = SHADOW_LOG.set(PathBuf::from(cache.to_string_lossy().into_owned()).join("shadow.log"));
         Ok(boxed(NmbDevice(Device::system_default_with(&options).map_err(e("device"))?, std::sync::OnceLock::new(), std::sync::Mutex::new(()))))
     })
 }
@@ -182,8 +185,32 @@ fn millis_after(text: &str, marker: &str) -> Option<f64> {
     rest[..end].parse().ok()
 }
 
+// The distinct reasons textures were given shadow images, their numbers masked, each written once to the cache directory's shadow.log
+// with the first such texture's message, at most SHADOW_REASONS of them.
+static SHADOW_LOG: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+static SHADOW_SEEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+const SHADOW_REASONS: usize = 64;
+
+fn note_shadow(text: &str) {
+    let masked: String = text.chars().map(|c| if c.is_ascii_digit() { '#' } else { c }).collect();
+    let Ok(mut seen) = SHADOW_SEEN.lock() else { return };
+    if seen.len() >= SHADOW_REASONS || seen.contains(&masked) {
+        return;
+    }
+    seen.push(masked);
+    if let Some(path) = SHADOW_LOG.get() {
+        use std::io::Write;
+        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            let _ = writeln!(file, "{text}");
+        }
+    }
+}
+
 fn observe_message(message: &DebugMessage) {
     use std::sync::atomic::Ordering::Relaxed;
+    if message.id_name == "shadowed-texture" {
+        note_shadow(&message.text);
+    }
     if message.id_name == "metal2vulkan-pipeline-creation" {
         let made = millis_after(&message.text, " made in ");
         let us = made.or_else(|| millis_after(&message.text, " failed in ")).map_or(0, |ms| (ms * 1000.0) as u64);
@@ -1008,17 +1035,25 @@ pub unsafe extern "C" fn nmb_function_new_specialized(library: *mut NmbLibrary, 
     })
 }
 
-/// Bytes of a function constant's `MTLDataType` (scalars and 2- and 4-wide vectors), 0 for a type that is not given a value.
+/// Packed bytes of a function constant's `MTLDataType` (scalars and vectors), 0 for a type that is not given a value.
 fn constant_bytes(raw: u32) -> usize {
-    match raw {
-        53 | 45 | 49 => 1,
-        16 | 46 | 50 | 54 => 2,
-        3 | 29 | 33 | 17 | 38 | 42 | 48 | 52 | 56 => 4,
-        4 | 30 | 34 | 19 | 40 | 44 | 81 | 85 => 8,
-        6 | 32 | 36 | 82 | 86 => 16,
-        84 | 88 => 32,
-        _ => 0,
-    }
+    // MTLDataType numbers each scalar family's 1-, 2-, 3- and 4-lane types consecutively; a value is packed, lanes times the scalar.
+    let (first, scalar) = match raw {
+        3..=6 => (3, 4),       // float
+        16..=19 => (16, 2),    // half
+        29..=32 => (29, 4),    // int
+        33..=36 => (33, 4),    // uint
+        37..=40 => (37, 2),    // short
+        41..=44 => (41, 2),    // ushort
+        45..=48 => (45, 1),    // char
+        49..=52 => (49, 1),    // uchar
+        53..=56 => (53, 1),    // bool
+        81..=84 => (81, 8),    // long
+        85..=88 => (85, 8),    // ulong
+        121..=124 => (121, 2), // bfloat
+        _ => return 0,
+    };
+    (raw - first + 1) as usize * scalar
 }
 
 /// The library's function `name` with every function constant it declares set to zero (false for a bool), for shader priming: a
@@ -1095,11 +1130,32 @@ pub struct NmbComputePipelineDescriptor {
     pub max_call_stack_depth: u64,
     pub adding_binary_functions: u64,
     pub mutability: [u64; 31],
+    pub linked: *const *mut NmbFunction,
+    pub linked_count: u64,
+    pub private_linked: *const *mut NmbFunction,
+    pub private_linked_count: u64,
+}
+
+/// The linked functions of a counted array of live function handles.
+fn linked_list(functions: *const *mut NmbFunction, count: u64) -> Result<Vec<LinkedFunction>, String> {
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    if functions.is_null() {
+        return Err("null linked functions".into());
+    }
+    // SAFETY: the caller's contract: `count` live handles.
+    let handles = unsafe { std::slice::from_raw_parts(functions, usize::try_from(count).map_err(e("linked function count"))?) };
+    handles.iter().map(|&function| Ok(get(function)?.0.linked_function())).collect()
 }
 
 fn compute_descriptor(descriptor: *const NmbComputePipelineDescriptor) -> Result<ComputePipelineDescriptor, String> {
     let d = get(descriptor)?;
-    let mut out = ComputePipelineDescriptor::new(StageSource::Function(get(d.function)?.0.function_descriptor()));
+    let mut linked = LinkedFunctions::new();
+    linked.functions = linked_list(d.linked, d.linked_count)?;
+    linked.private_functions = linked_list(d.private_linked, d.private_linked_count)?;
+    let kernel = get(d.function)?.0.function_descriptor().with_linked(linked);
+    let mut out = ComputePipelineDescriptor::new(StageSource::Function(kernel));
     out.max_total_threads_per_threadgroup = if d.max_threads == 0 { None } else { Some(u32::try_from(d.max_threads).map_err(e("compute max threads"))?) };
     out.threadgroup_size_is_multiple_of_execution_width = d.multiple_of_execution_width != 0;
     out.support_indirect_command_buffers = d.indirect != 0;

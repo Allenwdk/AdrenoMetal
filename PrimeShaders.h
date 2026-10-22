@@ -149,16 +149,45 @@ static std::string buildId() {
     return "unknown";
 }
 
+// A kernel that calls visible functions it does not define (`NeedsInput(LinkedFunction { symbol: "..." })`): link the library's function of
+// each symbol the refusals name and make the pipeline again, until it is made or a symbol names no function of the library.
+static bool linkedKernel(id<MTLDevice> device, id<MTLLibrary> lib, id<MTLFunction> kernel, NSError **error) {
+    NSMutableArray<id<MTLFunction>> *linked = [NSMutableArray array];
+    NSMutableSet<NSString *> *symbols = [NSMutableSet set];
+    for (unsigned round = 0; round < 16; ++round) {
+        NSString *why = (*error).localizedDescription;
+        NSRange at = [why rangeOfString:@"LinkedFunction { symbol: \""];
+        if (at.location == NSNotFound) return false;
+        NSString *rest = [why substringFromIndex:NSMaxRange(at)];
+        NSRange end = [rest rangeOfString:@"\""];
+        if (end.location == NSNotFound) return false;
+        NSString *symbol = [rest substringToIndex:end.location];
+        if ([symbols containsObject:symbol]) return false;
+        [symbols addObject:symbol];
+        id<MTLFunction> callee = [lib newFunctionWithName:symbol];
+        if (!callee) return false;
+        [linked addObject:callee];
+        MTLComputePipelineDescriptor *d = [MTLComputePipelineDescriptor new];
+        d.computeFunction = kernel;
+        MTLLinkedFunctions *functions = [MTLLinkedFunctions linkedFunctions];
+        functions.functions = linked;
+        d.linkedFunctions = functions;
+        *error = nil;
+        if ([device newComputePipelineStateWithDescriptor:d options:MTLPipelineOptionNone reflection:nil error:error]) return true;
+    }
+    return false;
+}
+
 // One library: every function it names, in its order; returns the log line.
 static std::string library(id<MTLDevice> device, const std::string &path, const std::string &current, const std::set<std::string> &bad) {
-    unsigned kernels = 0, renders = 0, made = 0, refused = 0, skipped = 0, zeroed = 0;
+    unsigned kernels = 0, renders = 0, made = 0, refused = 0, skipped = 0, zeroed = 0, linkedMade = 0;
     uint64_t waited = 0;
     std::string firstRefusal;   // the first refused function and why, so the log tells translator gaps from unspecialized constants
     const uint64_t began = nowMs();
     @autoreleasepool {
         NSError *error = nil;
         id<MTLLibrary> lib = [device newLibraryWithURL:[NSURL fileURLWithPath:@(path.c_str())] error:&error];
-        if (!lib) return path + " library refused";
+        if (!lib) return path + " library refused: " + (error ? error.localizedDescription.UTF8String : "no error");
         NSArray<NSString *> *names = lib.functionNames;
         for (NSString *name in names) {
             @autoreleasepool {
@@ -182,6 +211,10 @@ static std::string library(id<MTLDevice> device, const std::string &path, const 
                             [lib respondsToSelector:@selector(nb_newFunctionWithZeroConstants:)]) {
                             id<MTLFunction> zero = [(NSObject *)lib nb_newFunctionWithZeroConstants:name];
                             if (zero) {error = nil; ok = [device newComputePipelineStateWithFunction:zero error:&error] != nil; if (ok) ++zeroed;}
+                        }
+                        if (!ok && [error.localizedDescription containsString:@"LinkedFunction"]) {
+                            ok = linkedKernel(device, lib, function, &error);
+                            if (ok) ++linkedMade;
                         }
                     } else {
                         ++renders;
@@ -221,8 +254,8 @@ static std::string library(id<MTLDevice> device, const std::string &path, const 
     }
     unlink(current.c_str());
     char line[180];
-    snprintf(line, sizeof line, " kernels=%u renders=%u made=%u zeroed=%u refused=%u skipped=%u ms=%llu waited=%llu", kernels, renders, made,
-             zeroed, refused, skipped, (unsigned long long)(nowMs() - began), (unsigned long long)waited);
+    snprintf(line, sizeof line, " kernels=%u renders=%u made=%u zeroed=%u linked=%u refused=%u skipped=%u ms=%llu waited=%llu", kernels, renders,
+             made, zeroed, linkedMade, refused, skipped, (unsigned long long)(nowMs() - began), (unsigned long long)waited);
     return path + line + firstRefusal;
 }
 

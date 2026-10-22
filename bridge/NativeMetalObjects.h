@@ -150,6 +150,9 @@ struct NmbComputePipelineDescriptor {
     NmbFunction *function;
     uint64_t max_threads, multiple_of_execution_width, indirect, max_call_stack_depth, adding_binary_functions;
     uint64_t mutability[31];
+    /* linkedFunctions.functions and .privateFunctions: visible functions the kernel calls. */
+    NmbFunction *const *linked; uint64_t linked_count;
+    NmbFunction *const *private_linked; uint64_t private_linked_count;
 };
 NmbComputePipeline *nmb_compute_pipeline_new_with_options(NmbDevice *, NmbFunction *, const struct NmbPipelineOptions *);
 NmbComputePipeline *nmb_compute_pipeline_new_with_descriptor(NmbDevice *, const struct NmbComputePipelineDescriptor *, const struct NmbPipelineOptions *);
