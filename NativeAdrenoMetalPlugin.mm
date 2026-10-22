@@ -363,11 +363,17 @@ static id deviceForPort(unsigned port) {
             }
             return nullptr;
         }, gpu);
-        pthread_t exporter;
-        pthread_create(&exporter, &attributes, [](void *arg) -> void * {
-            cacheexport::run(*static_cast<Gpu *>(arg), gCacheDirectory);
-            return nullptr;
-        }, gpu);
+        // The cache directory's export to the UFS log only when NativeAdrenoMetal.cacheexport sits beside the bundle: Data persists across
+        // boots now, so the caches no longer need the trip through the host, and once priming has filled the directory, every rescan and
+        // export competed with the render server (int-245: the scanning thread at 45% CPU, the sending one at 48%, frames twice as slow).
+        char exportPath[1024];
+        if (requestedPath("NativeAdrenoMetal.cacheexport", exportPath, sizeof exportPath)) {
+            pthread_t exporter;
+            pthread_create(&exporter, &attributes, [](void *arg) -> void * {
+                cacheexport::run(*static_cast<Gpu *>(arg), gCacheDirectory);
+                return nullptr;
+            }, gpu);
+        }
         // Every Metal library of the OS through the runtime, 90 s after the render server opened the device (PrimeShaders.h); the boots that froze
         // or crashed before three minutes never primed anything. Progress is kept in the Data cache directory, so later boots resume.
         // The translator recurses deeply on large functions: give it the stack of a main thread.
