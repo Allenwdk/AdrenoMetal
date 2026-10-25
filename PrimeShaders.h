@@ -31,8 +31,10 @@ extern "C" unsigned native_bridge_metal_recent_commits(uint64_t windowUs);
 - (id<MTLFunction>)nb_newFunctionWithZeroConstants:(NSString *)name;
 @end
 
-// Priming's progress for the telemetry table (the PR row): 1 while a pipeline compiles, libraries done of the list, pipelines made.
-extern "C" {volatile uint32_t native_prime_compiling, native_prime_libraries_done, native_prime_libraries_total, native_prime_made;}
+// Priming's progress for the telemetry table (the PR row): what the thread does (1 a pipeline compiles, 2 it waits for the desktop to
+// settle, 3 it opens a library and its functions), libraries done of the list, pipelines made, and the most command buffers the last wait
+// saw in 250 ms.
+extern "C" {volatile uint32_t native_prime_compiling, native_prime_libraries_done, native_prime_libraries_total, native_prime_made, native_prime_rate;}
 
 namespace prime {
 static const char *const kRoots[] = {"/System/Library", "/Applications", "/System/Cryptexes/OS/System/Library"};
@@ -114,14 +116,20 @@ static std::vector<std::string> libraries(const std::string &listPath, std::stri
 // Waits until the render server is not animating: more than 4 command buffers in 250 ms (16 fps; an idle desktop redraws at about 12 fps)
 // means frames are being drawn, and a pipeline compile then competes with them for the CPU and the driver (int-244: priming during the
 // scripted swipes raised the median frame interval from 19 to 30 ms). A higher bar let compiles in once they had slowed the frames under
-// it (int-250: 12 per 250 ms, 460 pipelines made during the swipes at a 48 ms median). Returns the milliseconds it waited.
+// it (int-250: 12 per 250 ms, 460 pipelines made during the swipes at a 48 ms median). With a fixed 120 Hz vsync the idle desktop draws 6
+// per 250 ms (i516), so the bar is 8: still under any animation, which draws 15 to 30. A desktop that never drops under it still gets one
+// pipeline every 10 s (i513-i515: priming sat at 15/162 for the whole run without making a pipeline). Returns the milliseconds it waited.
 static uint64_t waitForQuiet() {
     const uint64_t began = nowMs();
     uint64_t quietSince = 0;
     bool busy = false;
+    native_prime_rate = 0;
     for (;;) {
         const uint64_t now = nowMs();
-        if (native_bridge_metal_recent_commits(250000) > 4) {busy = true; quietSince = 0;}
+        const unsigned commits = native_bridge_metal_recent_commits(250000);
+        if (commits > native_prime_rate) native_prime_rate = commits;
+        if (now - began >= 10000) return now - began;
+        if (commits > 8) {busy = true; quietSince = 0; native_prime_compiling = 2;}
         else if (!busy) return 0;
         else if (!quietSince) quietSince = now;
         // After animation, two seconds without it before the next compile, so a pause between two swipes does not let one in.
@@ -200,12 +208,15 @@ static std::string library(id<MTLDevice> device, const std::string &path, const 
     const uint64_t began = nowMs();
     @autoreleasepool {
         NSError *error = nil;
+        native_prime_compiling = 3;
         id<MTLLibrary> lib = [device newLibraryWithURL:[NSURL fileURLWithPath:@(path.c_str())] error:&error];
+        native_prime_compiling = 0;
         if (!lib) return path + " library refused: " + (error ? error.localizedDescription.UTF8String : "no error");
         NSArray<NSString *> *names = lib.functionNames;
         for (NSString *name in names) {
             @autoreleasepool {
                 const std::string key = path + "\t" + name.UTF8String;
+                native_prime_compiling = 3;
                 if (bad.count(key)) {++skipped; continue;}
                 id<MTLFunction> function = [lib newFunctionWithName:name];
                 if (!function) {++refused; continue;}
@@ -306,6 +317,7 @@ static void run(id<MTLDevice> device, std::string root, unsigned delaySeconds, c
         ++finished;
     }
     native_prime_libraries_done = finished;
+    native_prime_compiling = 0;
     char line[120];
     snprintf(line, sizeof line, "pass libraries=%u finished=%u ms=%llu", libs, finished, (unsigned long long)(nowMs() - began));
     appendLine(logPath, line);
