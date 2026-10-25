@@ -78,8 +78,9 @@ static void writeCurrent(const std::string &path, const std::string &line) {
 static uint64_t nowMs() {return clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000000;}
 
 // The libraries: first the paths of the list file beside the bundle (NativeAdrenoMetal.primelist, every .metallib of the OS image, one
-// absolute path per line), because the render server's sandbox refuses to list most directories (a scan alone found 8 of 166), then
-// whatever the scan still reaches. A path is taken once, by its file identity.
+// absolute path per line), because the render server's sandbox refuses to list most directories (a scan alone found 8 of 166). Only
+// without a list does the scan run: it walks every directory it can reach and held a core for 8 s with frames stalling (i557u, 120 s
+// into the boot). A path is taken once, by its file identity.
 // `note` gets the list's outcome: its path, the lines read, the libraries kept and the stat failures with the last errno.
 static std::vector<std::string> libraries(const std::string &listPath, std::string &note) {
     std::vector<std::string> found;
@@ -101,6 +102,7 @@ static std::vector<std::string> libraries(const std::string &listPath, std::stri
              found.size(), failed, lastErrno);
     note = line;
     for (const char *root : kRoots) {
+        if (!found.empty()) break;
         char *paths[] = {const_cast<char *>(root), nullptr};
         FTS *fts = fts_open(paths, FTS_PHYSICAL | FTS_NOCHDIR | FTS_XDEV, nullptr);
         if (!fts) continue;
@@ -208,6 +210,8 @@ static std::string library(id<MTLDevice> device, const std::string &path, const 
     const uint64_t began = nowMs();
     @autoreleasepool {
         NSError *error = nil;
+        // Reading and parsing a library is work too: not during an animation either.
+        waited += waitForQuiet();
         native_prime_compiling = 3;
         id<MTLLibrary> lib = [device newLibraryWithURL:[NSURL fileURLWithPath:@(path.c_str())] error:&error];
         native_prime_compiling = 0;
