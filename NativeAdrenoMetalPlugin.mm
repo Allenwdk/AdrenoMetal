@@ -136,7 +136,9 @@ static void reportDisplayState(Gpu &gpu) {
         markSample(gpu, now, 0xA000);
     } @catch (NSException *) {}
 }
-// Whether NativeAdrenoMetal.clients names this process (names separated by blanks, commas or new lines; "*" names every process).
+// Whether NativeAdrenoMetal.clients names this process (names separated by blanks, commas or new lines; "*" names every process; a
+// name that ends in "*" names every process whose name starts with it, so "com.apple.WebKit.*" covers the WebContent, Networking
+// and GPU service processes).
 static bool listedClient() {
     char path[1024];
     if (!requestedPath("NativeAdrenoMetal.clients", path, sizeof path)) return false;
@@ -147,8 +149,11 @@ static bool listedClient() {
     fclose(file);
     text[length] = 0;
     const char *self = getprogname();
-    for (char *save = nullptr, *name = strtok_r(text, " ,\t\r\n", &save); name; name = strtok_r(nullptr, " ,\t\r\n", &save))
+    for (char *save = nullptr, *name = strtok_r(text, " ,\t\r\n", &save); name; name = strtok_r(nullptr, " ,\t\r\n", &save)) {
         if (!strcmp(name, "*") || !strcmp(name, self)) return true;
+        const size_t nameLength = strlen(name);
+        if (nameLength && name[nameLength - 1] == '*' && !strncmp(name, self, nameLength - 1)) return true;
+    }
     return false;
 }
 // A listed process other than the render server: the same runtime on its own connection, with none of the render server's threads (no
