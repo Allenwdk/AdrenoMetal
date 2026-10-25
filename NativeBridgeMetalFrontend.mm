@@ -257,11 +257,16 @@ static std::mutex gProblemLock;
 static char gLastProblems[2][200];
 // The process's first problem, kept: a client process has no telemetry table, and its first refusal is usually the cause of the rest.
 static char gFirstProblem[200];
+// Called once with the first problem, on the thread that hit it: a polling reader missed WidgetRenderer's, which crashed within its first second.
+void (*native_bridge_metal_problem_hook)(const char *);
 static void noteProblem(NSString *what) {
  gProblems++;
  std::lock_guard<std::mutex> lock(gProblemLock);
  // A device answer the runtime lacks is reported at creation in every process and is harmless: the first problem is the next one.
- if(!gFirstProblem[0] && ![what hasPrefix:@"native-metal: no device answer"])strlcpy(gFirstProblem,what.UTF8String?:"?",sizeof gFirstProblem);
+ if(!gFirstProblem[0] && ![what hasPrefix:@"native-metal: no device answer"]) {
+  strlcpy(gFirstProblem,what.UTF8String?:"?",sizeof gFirstProblem);
+  if(native_bridge_metal_problem_hook)native_bridge_metal_problem_hook(gFirstProblem);
+ }
  memcpy(gLastProblems[1],gLastProblems[0],sizeof gLastProblems[0]);
  strlcpy(gLastProblems[0],what.UTF8String?:"?",sizeof gLastProblems[0]);
 }
@@ -1058,7 +1063,10 @@ extern "C" void NBWaitInFlight(uint64_t beforeUs);
 - (CFTimeInterval)GPUEndTime {return nmb_command_buffer_gpu_time(_handle,true);}
 - (id)encoder:(NBEncoder *)encoder handle:(NmbEncoder *)handle what:(NSString *)what {
  if(self.committed){[self refuse:[what stringByAppendingString:@" after commit"]];return nil;}
- if(!handle){[self refuse:[NSString stringWithFormat:@"%@: %@",what,lastError()]];return nil;}
+ /* A refused encoder is still an object: its calls fail on the null handle and the buffer completes with an error. RenderBox caches the
+  * encoder's IMPs with methodForSelector:, and on nil it called address 0 (i568: WidgetRenderer_Default crashed eight launches running, then
+  * hit its open cap and lost the device). */
+ if(!handle){[self refuse:[NSString stringWithFormat:@"%@: %@",what,lastError()]];encoder.commandBuffer=self;return encoder;}
  encoder.handle=handle;encoder.commandBuffer=self;return encoder;
 }
 - (id<MTLComputeCommandEncoder>)computeCommandEncoder {

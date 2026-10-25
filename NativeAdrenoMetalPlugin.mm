@@ -160,6 +160,7 @@ static bool listedClient() {
 // display hand-off, telemetry, benchmark or cache export). Its shader cache lives in its own cache or temp directory.
 // The reason a client's device failed, as a text line the driver keeps per process (the render server's report row is rewritten every ten seconds):
 // "<step> <detail>", through the marker stream (a connection is not needed). The Gpu object is made only on this path.
+static unsigned gClientPort;
 static void clientFailure(unsigned port, const char *step, const char *detail) {
     if (Gpu *gpu = makeGpu(port)) {
         char text[64];
@@ -199,17 +200,14 @@ static id clientDevice(unsigned port) {
         if (!device && !lastError[0]) lastError = nmb_last_error();
     }
     if (!device) clientFailure(port, usable ? "no-device" : "no-cachedir", lastError);
-    // The client's first problem, once, on the same text line: WidgetRenderer crashed on a nil render encoder with no reason anywhere readable
-    // (its own log lines need the plugin's format strings, which the device does not keep). Checked every second for ten minutes.
+    // The client's first problem, once, on the same text line, sent from the thread that hit it: WidgetRenderer crashed on a nil render
+    // encoder with no reason anywhere readable (its own log lines need the plugin's format strings, which the device does not keep), and a
+    // once-a-second reader never ran before the crash (i568).
     if (device) {
-        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-            for (unsigned second = 0; second < 600; ++second) {
-                char problem[200] = {};
-                const uint64_t count = native_bridge_metal_first_problem(problem, sizeof problem);
-                if (count && problem[0]) {clientFailure(port, "problem", problem); return;}
-                sleep(1);
-            }
-        });
+        gClientPort = port;
+        native_bridge_metal_problem_hook = [](const char *problem) {clientFailure(gClientPort, "problem", problem);};
+        char problem[200] = {};
+        if (native_bridge_metal_first_problem(problem, sizeof problem) && problem[0]) clientFailure(port, "problem", problem);
     }
     return device;
 }
