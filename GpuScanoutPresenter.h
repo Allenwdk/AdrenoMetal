@@ -8,8 +8,12 @@
 #include <unistd.h>
 #include <stdint.h>
 #include <string.h>
+#include <atomic>
 
 namespace gpupresent {
+
+// Measurement only: when set, the copy covers the upper half of the rows (the GPU cost of the copy is what is being measured).
+inline std::atomic<bool> gHalfRows{false};
 
 struct Scanout {
     void *base;       // writable mapping of the firmware framebuffer (page aligned)
@@ -43,6 +47,7 @@ public:
         if (!frame.base || ((uintptr_t)frame.base & (page - 1)) || !frame.bytes || (frame.bytes & (page - 1)) ||
             frame.width != scanout_.width || frame.height != scanout_.height || frame.stride < row ||
             (size_t)frame.height > frame.bytes / frame.stride || frame.stride * (frame.height - 1) + row > frame.bytes) return kBadFrame;
+        const uint32_t rows = gHalfRows.load(std::memory_order_relaxed) ? frame.height / 2 : frame.height;
         id<MTLBuffer> source = sourceFor(frame);
         if (!source) return kNoResource;
         id<MTLCommandBuffer> commands = [queue_ commandBuffer];
@@ -50,7 +55,7 @@ public:
         if (!blit) return kNoResource;
         if (frame.stride == scanout_.stride) {
             // Equal pitch: the rows are one contiguous run.
-            [blit copyFromBuffer:source sourceOffset:0 toBuffer:target_ destinationOffset:0 size:frame.stride * (frame.height - 1) + row];
+            [blit copyFromBuffer:source sourceOffset:0 toBuffer:target_ destinationOffset:0 size:frame.stride * (rows - 1) + row];
         } else {
             // A linear texture over the surface pages reads them with the surface's pitch and writes the scanout's pitch.
             MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:frame.width
@@ -58,13 +63,13 @@ public:
             d.storageMode = MTLStorageModeShared;
             d.usage = MTLTextureUsageShaderRead;
             if (frame.stride % [device_ minimumLinearTextureAlignmentForPixelFormat:MTLPixelFormatBGRA8Unorm]) {
-                for (uint32_t y = 0; y < frame.height; ++y)
+                for (uint32_t y = 0; y < rows; ++y)
                     [blit copyFromBuffer:source sourceOffset:y * frame.stride toBuffer:target_ destinationOffset:y * scanout_.stride size:row];
             } else {
                 id<MTLTexture> texture = [source newTextureWithDescriptor:d offset:0 bytesPerRow:frame.stride];
                 if (!texture) {[blit endEncoding]; return kNoResource;}
                 [blit copyFromTexture:texture sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
-                           sourceSize:MTLSizeMake(frame.width, frame.height, 1) toBuffer:target_ destinationOffset:0
+                           sourceSize:MTLSizeMake(frame.width, rows, 1) toBuffer:target_ destinationOffset:0
                     destinationBytesPerRow:scanout_.stride destinationBytesPerImage:scanout_.stride * frame.height];
             }
         }

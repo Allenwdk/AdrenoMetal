@@ -22,6 +22,9 @@
 #include <dlfcn.h>
 #include <execinfo.h>
 #include <mach/mach.h>
+#include <thread>
+#include <fcntl.h>
+#include <unistd.h>
 #include "bridge/NativeMetalObjects.h"
 #include "NativeBridgeMetalFrontend.h"
 
@@ -53,6 +56,195 @@ static std::atomic<uint64_t> gSurfaceFlushBytes,gSurfaceFlushDuplicates;
 struct EncodedWork {uint32_t passes,draws,dispatches,blits;uint64_t pixels;};
 struct CommitRecord {uint64_t committedUs=0,callbackUs=0,ageUs=0;int64_t scheduledUs=-1;uint32_t index=0;EncodedWork work={};};
 static CommitRecord gCommitRing[32];
+// Where the time between two render commits goes, by how long that interval was: [0] under 11 ms, [1] to 16.7, [2] to 33, [3] to 200 ms
+// (longer ones are idle). pg = the earlier render buffer's commit-to-callback, enc = this buffer's creation-to-commit, res = what is left
+// (negative when the two overlapped), kpx = the earlier one's thousands of pixels, hv = how many earlier ones were over 30 Mpx.
+// ---- frame trace: one record per command buffer and per wait, appended to a file by a writer thread ----
+// The file is read by the kernel's diagnostic export (BootDiagExport.c lists it), so a hang or a reset still leaves everything up to then.
+// 72-byte records: type 1 command buffer {idx, t0 created, t1 committed, t2 scheduled (0: unknown), t3 completion callback, a passes, b draws,
+// c thousands of pixels, d blits, tid creator thread, cpu0/cpu1 its cumulative CPU microseconds at creation and at commit, tid2 committing
+// thread}; type 2 waitUntilCompleted {t0 begin, t1 end, tid, a caller (low 32 bits), cpu0 the thread's CPU time at the start, cpu1 at the end};
+// type 3 the same for waitUntilScheduled; type 4 a thread's name {tid, 24 characters in t0..t2}. Times are nowUs().
+struct TraceRec {uint32_t type,idx;uint64_t t0,t1,t2,t3;uint32_t a,b,c,d,tid,cpu0,cpu1,tid2;};
+static_assert(sizeof(TraceRec)==72,"trace record");
+static TraceRec gTrace[16384];
+static std::atomic<uint32_t> gTraceHead{0};
+static std::atomic<bool> gTraceStarted{false};
+static uint32_t threadCpuUs() {
+ thread_basic_info_data_t info;mach_msg_type_number_t count=THREAD_BASIC_INFO_COUNT;
+ if(thread_info(pthread_mach_thread_np(pthread_self()),THREAD_BASIC_INFO,(thread_info_t)&info,&count)!=KERN_SUCCESS)return 0;
+ return (uint32_t)((uint64_t)(info.user_time.seconds+info.system_time.seconds)*1000000ull+(uint64_t)(info.user_time.microseconds+info.system_time.microseconds));
+}
+static uint32_t threadIdLow() {uint64_t id=0;pthread_threadid_np(NULL,&id);return (uint32_t)id;}
+static void tracePush(const TraceRec &rec) {
+ const uint32_t at=gTraceHead.fetch_add(1);
+ gTrace[at%16384]=rec;
+ gTrace[at%16384].idx=rec.type==1?rec.idx:at;
+}
+static void traceStartWriter();
+// type 5 swap served by the scanout client: {idx, t0 offer arrived, t1 GPU copy returned, t2 swap completed, a sequence, b result}
+extern "C" void NBTraceSwap(uint64_t offered,uint64_t copied,uint64_t completed,uint32_t sequence,uint32_t result) {
+ TraceRec rec={};rec.type=5;rec.t0=offered;rec.t1=copied;rec.t2=completed;rec.a=sequence;rec.b=result;tracePush(rec);
+ traceStartWriter();
+}
+static void traceNote(uint32_t tid) {
+ static std::atomic<uint32_t> seen[64];
+ for(unsigned i=0;i<64;i++){uint32_t v=seen[i].load();if(v==tid)return;if(!v){uint32_t zero=0;if(seen[i].compare_exchange_strong(zero,tid))break;if(seen[i].load()==tid)return;}}
+ TraceRec rec={};rec.type=4;rec.tid=tid;pthread_getname_np(pthread_self(),(char *)&rec.t0,24);tracePush(rec);
+}
+
+// ---- sampler: where the render thread's CPU goes between a command buffer's creation and its commit ----
+// A thread suspends the render thread every 500 us while it is inside that window and keeps the program counter plus the frame-pointer chain in a
+// ring (no allocation, no locks: the suspended thread may hold any). The writer thread resolves the addresses with dladdr and rewrites cpu.profile
+// every few seconds: L = samples whose leaf is that symbol, I = samples with that symbol anywhere in the chain.
+static std::atomic<mach_port_t> gSampleThread{0};
+static std::atomic<uint64_t> gSampleTop{0};
+struct StackSample {uint64_t frames[8];};
+static StackSample gSamples[8192];
+static std::atomic<uint32_t> gSampleHead{0};
+static std::atomic<bool> gSamplerStarted{false};
+static void sampleWindowOpen() {
+#ifndef NB_SAMPLER
+ return;   // the sampler suspends the render thread 2000 times a second: off unless asked for
+#endif
+ char name[32]={};pthread_getname_np(pthread_self(),name,sizeof name);
+ if(strncmp(name,"com.apple.coreanimation",23))return;
+ gSampleTop.store((uint64_t)pthread_get_stackaddr_np(pthread_self()));
+ gSampleThread.store(pthread_mach_thread_np(pthread_self()));
+ if(!gSamplerStarted.exchange(true))std::thread([]{
+  pthread_setname_np("frame-sampler");
+  for(;;) {
+   usleep(500);
+   const mach_port_t port=gSampleThread.load();
+   if(!port)continue;
+   if(thread_suspend(port)!=KERN_SUCCESS)continue;
+   arm_thread_state64_t state;mach_msg_type_number_t count=ARM_THREAD_STATE64_COUNT;
+   StackSample sample={};
+   if(thread_get_state(port,ARM_THREAD_STATE64,(thread_state_t)&state,&count)==KERN_SUCCESS) {
+    const uint64_t mask=0x0000007fffffffffull,top=gSampleTop.load();
+    const uint64_t sp=arm_thread_state64_get_sp(state);
+    unsigned n=0;
+    sample.frames[n++]=arm_thread_state64_get_pc(state)&mask;
+    sample.frames[n++]=arm_thread_state64_get_lr(state)&mask;
+    uint64_t fp=arm_thread_state64_get_fp(state)&mask;
+    while(n<8 && fp>=sp && fp+16<=top && !(fp&15)) {
+     const uint64_t *record=(const uint64_t *)fp;
+     sample.frames[n++]=record[1]&mask;
+     const uint64_t next=record[0]&mask;
+     if(next<=fp)break;
+     fp=next;
+    }
+   }
+   thread_resume(port);
+   if(sample.frames[0])gSamples[gSampleHead.fetch_add(1)%8192]=sample;
+  }
+ }).detach();
+}
+static void sampleWindowClose() {
+ if(gSampleThread.load()==pthread_mach_thread_np(pthread_self()))gSampleThread.store(0);
+}
+static void sampleWriteProfile(uint32_t &consumed,int &fd,const char *const *paths) {
+ static std::unordered_map<uint64_t,std::string> names;
+ static std::unordered_map<std::string,uint32_t> leaf,inclusive;
+ struct AddressCount {uint32_t leaf=0,inclusive=0;};
+ static std::unordered_map<uint64_t,AddressCount> addresses;
+ static uint32_t total=0,rounds=0;
+ const uint32_t head=gSampleHead.load();
+ if(head-consumed>8000)consumed=head-8000;
+ auto resolve=[&](uint64_t address)->const std::string & {
+  auto it=names.find(address);if(it!=names.end())return it->second;
+  Dl_info info={};std::string name;
+  if(dladdr((const void *)address,&info)){
+   const char *image=info.dli_fname?strrchr(info.dli_fname,'/'):NULL;image=image?image+1:(info.dli_fname?info.dli_fname:"?");
+   char text[256];
+   if(info.dli_sname)snprintf(text,sizeof text,"%s`%s+%llu",image,info.dli_sname,(unsigned long long)(address-(uint64_t)info.dli_saddr));
+   else snprintf(text,sizeof text,"%s`+0x%llx",image,(unsigned long long)(address-(uint64_t)info.dli_fbase));
+   name=text;
+  } else name="?";
+  return names[address]=name;
+ };
+ while(consumed<head) {
+  const StackSample &sample=gSamples[consumed%8192];++consumed;++total;
+  leaf[resolve(sample.frames[0])]++;
+  addresses[sample.frames[0]].leaf++;
+  for(unsigned i=0;i<8 && sample.frames[i];i++){bool dup=false;for(unsigned j=0;j<i;j++)if(sample.frames[j]==sample.frames[i])dup=true;if(!dup)addresses[sample.frames[i]].inclusive++;}
+  std::string seen[8];unsigned count=0;
+  for(unsigned i=0;i<8 && sample.frames[i];i++) {
+   std::string name=resolve(sample.frames[i]);
+   const size_t plus=name.rfind('+');if(plus!=std::string::npos && i>0)name.resize(plus);
+   bool dup=false;for(unsigned j=0;j<count;j++)if(seen[j]==name)dup=true;
+   if(!dup){seen[count++]=name;inclusive[name]++;}
+  }
+ }
+ if(++rounds%12)return;
+ if(fd<0)for(int i=0;i<2 && fd<0;i++)fd=open(paths[i],O_WRONLY|O_CREAT|O_TRUNC,0644);
+ if(fd<0)return;
+ auto top=[&](std::unordered_map<std::string,uint32_t> &map,char tag,unsigned limit,std::string &out) {
+  std::vector<std::pair<uint32_t,std::string>> rows;
+  for(auto &entry:map)rows.push_back({entry.second,entry.first});
+  std::sort(rows.rbegin(),rows.rend());
+  for(unsigned i=0;i<rows.size() && i<limit;i++){char line[320];snprintf(line,sizeof line,"%c %u %s\n",tag,rows[i].first,rows[i].second.c_str());out+=line;}
+ };
+ std::string out="samples "+std::to_string(total)+"\n";
+ top(leaf,'L',60,out);top(inclusive,'I',90,out);
+ {   // exact addresses (image path, offset in the image) for offline symbolization, the busiest ones
+  std::vector<std::pair<uint32_t,uint64_t>> rows;
+  for(auto &entry:addresses)rows.push_back({entry.second.inclusive,entry.first});
+  std::sort(rows.rbegin(),rows.rend());
+  for(unsigned i=0;i<rows.size() && i<1500;i++){
+   Dl_info info={};if(!dladdr((const void *)rows[i].second,&info) || !info.dli_fname)continue;
+   char line[400];snprintf(line,sizeof line,"A %u %u %s 0x%llx\n",rows[i].first,addresses[rows[i].second].leaf,info.dli_fname,(unsigned long long)(rows[i].second-(uint64_t)info.dli_fbase));
+   out+=line;
+  }
+ }
+ ftruncate(fd,0);lseek(fd,0,SEEK_SET);
+ if(write(fd,out.data(),out.size())<0)return;
+}
+static void traceStartWriter() {
+ bool expected=false;
+ if(!gTraceStarted.compare_exchange_strong(expected,true))return;
+ std::thread([]{
+  pthread_setname_np("frame-trace");
+  int fd=-1;
+  static const char *const paths[]={"/private/var/mobile/Library/Caches/com.apple.backboardd/m2v/frames.trace","/private/var/root/Library/Caches/com.apple.backboardd/m2v/frames.trace"};
+  uint32_t written=0,sampled=0;int profileFd=-1;
+  static const char *const profilePaths[]={"/private/var/mobile/Library/Caches/com.apple.backboardd/m2v/cpu.profile","/private/var/root/Library/Caches/com.apple.backboardd/m2v/cpu.profile"};
+  for(;;) {
+   usleep(400000);
+   sampleWriteProfile(sampled,profileFd,profilePaths);
+   if(fd<0)for(const char *path:paths){fd=open(path,O_WRONLY|O_CREAT|O_TRUNC,0644);if(fd>=0)break;}
+   if(fd<0)continue;
+   uint32_t head=gTraceHead.load();
+   if(head<written+4)continue;
+   head-=4;                                   // records still being filled stay for the next round
+   if(head-written>16000)written=head-16000;   // the ring lapped the writer: the oldest are gone
+   while(written<head){
+    uint32_t n=head-written;const uint32_t room=16384-written%16384;if(n>room)n=room;
+    if(write(fd,&gTrace[written%16384],n*sizeof(TraceRec))<0)break;
+    written+=n;
+   }
+  }
+ }).detach();
+}
+
+struct FrameAttribution {
+ uint64_t prevCommitUs=0,prevCtcUs=0,prevKpx=0;
+ struct Bin {uint32_t n=0,heavy=0;uint64_t sumI=0,sumPg=0,sumEnc=0,sumKpx=0;int64_t sumRes=0;} bins[4];
+};
+static FrameAttribution gAttribution;
+// Who calls waitUntilCompleted: the caller's return address (the 36 low bits) and its caller's, with a count and the total wait.
+struct WaitCaller {std::atomic<uint64_t> lr{0},lr2{0};std::atomic<uint32_t> n{0};std::atomic<uint64_t> us{0};char thread[24]={0},symbol[28]={0};};
+static WaitCaller gWaitCallers[8];
+static void noteWaitCaller(uint64_t lr,uint64_t lr2,uint64_t us) {
+ for(unsigned i=0;i<8;i++) {
+  uint64_t seen=gWaitCallers[i].lr.load();
+  if(!seen){uint64_t zero=0;if(gWaitCallers[i].lr.compare_exchange_strong(zero,lr)){
+   gWaitCallers[i].lr2=lr2;pthread_getname_np(pthread_self(),gWaitCallers[i].thread,sizeof gWaitCallers[i].thread);
+   Dl_info info;if(dladdr((void*)(uintptr_t)lr2,&info)&&info.dli_sname)strlcpy(gWaitCallers[i].symbol,info.dli_sname,sizeof gWaitCallers[i].symbol);
+  }seen=gWaitCallers[i].lr.load();}
+  if(seen==lr){gWaitCallers[i].n++;gWaitCallers[i].us+=us;return;}
+ }
+}
 static std::mutex gCommitLock;
 // Command buffers committed in the last windowUs microseconds (at most the ring's 32): shader priming waits while the render server animates.
 extern "C" unsigned native_bridge_metal_recent_commits(uint64_t windowUs) {
@@ -83,7 +275,7 @@ static std::atomic<uint64_t> gSurfaceTextures,gSurfaceRefusals,gSurfacePlanar;
 struct SurfaceRefusal {uint32_t step,format,planes,plane,pixelFormat;uint64_t offset,row,allocation,width,height;};
 static SurfaceRefusal gSurfaceLastRefusal;
 // Shader priming's progress (PrimeShaders.h, in the plugin), for the PR row.
-extern "C" volatile uint32_t native_prime_compiling,native_prime_libraries_done,native_prime_libraries_total,native_prime_made;
+extern "C" volatile uint32_t native_prime_compiling,native_prime_libraries_done,native_prime_libraries_total,native_prime_made,native_prime_rate;
 static void refuseSurface(uint32_t step,IOSurfaceRef surface,MTLTextureDescriptor *d,NSUInteger plane,uint64_t offset,uint64_t row) {
  gSurfaceRefusals++;
  SurfaceRefusal r={step,surface?IOSurfaceGetPixelFormat(surface):0,surface?(uint32_t)IOSurfaceGetPlaneCount(surface):0,(uint32_t)plane,
@@ -537,6 +729,8 @@ static void notified(void *context,uint64_t value) {
 @public
  EncodedWork encodedWork;   // the command buffer's single encoder thread, not global counter deltas
  uint64_t createdUs;
+ uint32_t createCpu,createTid,commitCpu,commitTid;
+ BOOL earlyEligible;   // made by the render server's thread: its completed handlers may run at submission (see fireEarly)
 }
 @property(nonatomic) NmbCommandBuffer *handle;
 @property(nonatomic,strong) NBQueue *queue;
@@ -815,10 +1009,20 @@ static void waitForResource(id resource) {
 
 static void completed(void *context);
 static void scheduled(void *context);
+// Early completed handlers. The render server starts its next frame from the completed handler of the previous one, so a frame's encoding
+// waited for the GPU of the frame before it (interval = GPU time + encode time). The handlers of the server's own render buffers run at submission
+// instead; the swap offered by them is held back by the scanout client until the GPU finished everything committed before the offer
+// (NBWaitInFlight), and waitUntilCompleted, the resource waits and the real completion work (surface flushes, release) are unchanged.
+static bool earlyOn() {return false;}   // reverted: with the handlers early the blur passes read frames that were not finished (i343, i344)
+static bool onRenderServerThread() {
+ char name[32]={};pthread_getname_np(pthread_self(),name,sizeof name);
+ return !strncmp(name,"com.apple.coreanimation",23);
+}
+extern "C" void NBWaitInFlight(uint64_t beforeUs);
 @implementation NBCommandBuffer
 - (instancetype)init {
  if((self=[super init])){_scheduledHandlers=[NSMutableArray array];_completedHandlers=[NSMutableArray array];_surfaces=[NSMutableSet set];_resourceOwners=[NSMutableSet set];_handlers=dispatch_group_create();_schedulingHandlers=dispatch_group_create();}
- if(self)createdUs=nowUs();
+ if(self){createdUs=nowUs();createCpu=threadCpuUs();createTid=threadIdLow();earlyEligible=onRenderServerThread();sampleWindowOpen();}
  return self;
 }
 - (void)dealloc {nmb_command_buffer_release(_handle);}
@@ -961,6 +1165,7 @@ static void scheduled(void *context);
  if(self.committed){NBLOG(@"native-metal: commit twice");return;}
  self.committed=YES;
  self.committedUs=nowUs();
+ commitCpu=threadCpuUs();commitTid=threadIdLow();sampleWindowClose();
  {
   std::lock_guard<std::mutex> lock(gCommitLock);
   // Assign once under the same lock as publication. A concurrent commit cannot reuse this index.
@@ -976,18 +1181,32 @@ static void scheduled(void *context);
   // Completion owns this reference; the runtime orders the non-owning scheduled callback before it.
   void *context=(__bridge_retained void *)self;
   if(nmb_command_buffer_on_completed(_handle,completed,context) &&
-     nmb_command_buffer_on_scheduled(_handle,scheduled,context) && nmb_command_buffer_commit(_handle))return;
+     nmb_command_buffer_on_scheduled(_handle,scheduled,context) && nmb_command_buffer_commit(_handle)) {[self fireEarly];return;}
   (void)CFBridgingRelease(context);   // refused registration/commit cannot call the registered handlers
   [self refuse:[@"commit: " stringByAppendingString:lastError()]];
  }
  self.failedLocally=YES;gCommitFailures++;
  dispatch_async(dispatch_get_global_queue(QOS_CLASS_DEFAULT,0),^{[self finish];});
 }
+- (void)fireEarly {
+ if(!earlyEligible || encodedWork.passes==0 || !earlyOn())return;
+ NSArray *handlers;
+ @synchronized(self){handlers=[_completedHandlers copy];[_completedHandlers removeAllObjects];}
+ if(!handlers.count)return;
+ dispatch_queue_t queue=_queue.completionQueue?:dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE,0);
+ dispatch_async(queue,^{for(MTLCommandBufferHandler block in handlers)block((id<MTLCommandBuffer>)self);});
+}
 - (void)waitUntilCompleted {
  if(!self.committed)return;
  const uint64_t began=nowUs();
  if(!self.failedLocally)nmb_command_buffer_wait(_handle,0);
+ const uint32_t cpuStart=threadCpuUs();
  dispatch_group_wait(_handlers,DISPATCH_TIME_FOREVER);
+ {
+  TraceRec rec={};rec.type=2;rec.t0=began;rec.t1=nowUs();rec.tid=threadIdLow();rec.a=(uint32_t)(uintptr_t)__builtin_return_address(0);
+  rec.cpu0=cpuStart;rec.cpu1=threadCpuUs();traceNote(rec.tid);tracePush(rec);
+ }
+ noteWaitCaller((uint64_t)__builtin_return_address(0)&0xfffffffffull,(uint64_t)__builtin_return_address(0),nowUs()-began);
  gTimeWaitCompleted.add(began);
 }
 - (void)waitUntilScheduled {
@@ -996,10 +1215,22 @@ static void scheduled(void *context);
  if(!self.failedLocally && !nmb_command_buffer_wait_scheduled(_handle)){
   NBLOG(@"native-metal: waitUntilScheduled refused: %@",lastError());return;
  }
+ const uint32_t cpuStart=threadCpuUs();
  dispatch_group_wait(_schedulingHandlers,DISPATCH_TIME_FOREVER);
+ {
+  TraceRec rec={};rec.type=3;rec.t0=began;rec.t1=nowUs();rec.tid=threadIdLow();rec.a=(uint32_t)(uintptr_t)__builtin_return_address(0);
+  rec.cpu0=cpuStart;rec.cpu1=threadCpuUs();traceNote(rec.tid);tracePush(rec);
+ }
  gTimeWaitScheduled.add(began);
 }
 @end
+// The scanout client: before it copies an offered frame, the GPU work committed up to then must be done.
+extern "C" void NBWaitInFlight(uint64_t beforeUs) {
+ if(!earlyOn())return;
+ NSArray *pending;@synchronized(gInFlight){pending=gInFlight.allObjects;}
+ for(NBCommandBuffer *commandBuffer in pending)
+  if(commandBuffer.committed && !commandBuffer.failedLocally && commandBuffer.committedUs<=beforeUs)nmb_command_buffer_wait(commandBuffer.handle,0);
+}
 static void scheduled(void *context) {[(__bridge NBCommandBuffer *)context didSchedule];}
 // The runtime's completion: the command buffer's own reference, taken at commit, is given back here.
 static void completed(void *context) {
@@ -1011,7 +1242,28 @@ static void completed(void *context) {
   uint64_t seen=gTimeEncodeToCommit.slowest.load();while(took>seen && !gTimeEncodeToCommit.slowest.compare_exchange_weak(seen,took)){}
   std::lock_guard<std::mutex> lock(gCommitLock);
   CommitRecord &r=gCommitRing[commandBuffer.commitIndex%32];
-  if(r.index==commandBuffer.commitIndex)r.callbackUs=took;
+  if(r.index==commandBuffer.commitIndex) {
+   r.callbackUs=took;
+   {
+    traceStartWriter();traceNote(commandBuffer->createTid);
+    if(commandBuffer->commitTid!=commandBuffer->createTid)traceNote(commandBuffer->commitTid);
+    TraceRec rec={};rec.type=1;rec.idx=r.index;rec.t0=commandBuffer->createdUs;rec.t1=r.committedUs;rec.t2=r.scheduledUs>=0?r.committedUs+(uint64_t)r.scheduledUs:0;
+    rec.t3=r.committedUs+took;rec.a=r.work.passes;rec.b=r.work.draws;rec.c=(uint32_t)(r.work.pixels>>10);rec.d=r.work.blits;
+    rec.tid=commandBuffer->createTid;rec.cpu0=commandBuffer->createCpu;rec.cpu1=commandBuffer->commitCpu;rec.tid2=commandBuffer->commitTid;
+    tracePush(rec);
+   }
+   if(r.work.passes>0 && r.work.pixels>0) {
+    FrameAttribution &a=gAttribution;
+    const uint64_t interval=a.prevCommitUs?r.committedUs-a.prevCommitUs:0;
+    if(interval && interval<200000) {
+     FrameAttribution::Bin &b=a.bins[interval<11000?0:interval<16700?1:interval<33000?2:3];
+     b.n++;b.sumI+=interval;b.sumPg+=a.prevCtcUs;b.sumEnc+=r.ageUs;b.sumKpx+=a.prevKpx;
+     b.sumRes+=(int64_t)interval-(int64_t)a.prevCtcUs-(int64_t)r.ageUs;
+     if(a.prevKpx>30000)b.heavy++;
+    }
+    a.prevCommitUs=r.committedUs;a.prevCtcUs=took;a.prevKpx=r.work.pixels>>10;
+   }
+  }
  }
  [commandBuffer finish];
 }
@@ -1762,7 +2014,7 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
  {
   std::lock_guard<std::mutex> lock(gProblemLock);
   char formats[160];native_bridge_metal_formats_locked(formats,sizeof formats);row("F %.86s",formats);
-  row("PR compiling=%u libs=%u/%u made=%u",native_prime_compiling,native_prime_libraries_done,native_prime_libraries_total,native_prime_made);
+  row("PR compiling=%u libs=%u/%u made=%u rate=%u",native_prime_compiling,native_prime_libraries_done,native_prime_libraries_total,native_prime_made,native_prime_rate);
   const SurfaceRefusal &r=gSurfaceLastRefusal;
   if(r.step)row("SR %u %08x %c%c%c%c pl%u/%u o%llx rb%llu a%llx %llux%llu pf%u",r.step,r.format,(char)(r.format>>24),(char)(r.format>>16),(char)(r.format>>8),
    (char)r.format,r.plane,r.planes,(unsigned long long)r.offset,(unsigned long long)r.row,(unsigned long long)r.allocation,(unsigned long long)r.width,
@@ -1774,6 +2026,17 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
   std::lock_guard<std::mutex> lock(gCommitLock);
   const uint32_t newest=(uint32_t)gCommits.load();
   row("%s","Q timing v2: per-buffer API counts; ctc=commit-to-callback; age includes caller idle");
+  for(unsigned i=0;i<8;i++) {
+   const WaitCaller &w=gWaitCallers[i];
+   if(!w.n.load())continue;
+   row("WC%u lr=%llx n%u us%llu t=%.23s s=%.27s",i,(unsigned long long)w.lr.load(),w.n.load(),(unsigned long long)w.us.load(),w.thread,w.symbol);
+  }
+  for(unsigned i=0;i<4;i++) {
+   const FrameAttribution::Bin &b=gAttribution.bins[i];
+   if(!b.n)continue;
+   row("FA%u n%u I%llu pg%llu enc%llu res%lld kpx%llu hv%u",i,b.n,(unsigned long long)(b.sumI/b.n),(unsigned long long)(b.sumPg/b.n),
+    (unsigned long long)(b.sumEnc/b.n),(long long)(b.sumRes/(int64_t)b.n),(unsigned long long)(b.sumKpx/b.n),b.heavy);
+  }
   for(uint32_t k=0;k<20 && k<newest;k++) {
    const CommitRecord &r=gCommitRing[(newest-k)%32];
    if(r.index!=newest-k)continue;
