@@ -220,12 +220,11 @@ static id deviceForPort(unsigned port) {
         if (tried) return device;
         tried = true;
         exceptiondiag::start(); // the throw site of an uncaught exception, for the kernel's THROW row (ExceptionDiag.h)
-        // Every Metal process renders in system memory: Turnip's GMEM passes hand work between the BV and BR threads, and with IFPC off
-        // and a context reset on every client switch the two still stopped waiting on each other inside a pass (int-261p, int-262: GPU idle,
-        // BR one IB ahead, BV inside a draw IB2). int-257's nobin covered the render server only. System memory alone still let BV run
-        // ahead of BR across passes (concurrent binning is emitted for sysmem passes too) and it hung the same way in int-265: no
-        // concurrent binning either.
-        setenv("TU_DEBUG", "sysmem,nocb", 0);
+        // No concurrent binning in any Metal process: with it BV ran ahead of BR and the two stopped waiting on each other inside a pass
+        // (int-261p, int-262, and in system memory int-265). Without it Turnip's autotune picks tile memory (GMEM) or system memory per
+        // pass: i553 forced system memory for every pass, the GPU busy 19 % at 680 MHz. A tile store writes whole 16x4 blocks, which the
+        // runtime keeps within a texture's rows (bridge patch 0016).
+        setenv("TU_DEBUG", "nocb", 0);
         if (strcmp(getprogname(), "backboardd") != 0) return device = clientDevice(port);
         // The discovery releases the accelerator port when it is done; the monitor and the scanout client keep using it.
         if (void *iokit = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW | RTLD_LOCAL)) {
