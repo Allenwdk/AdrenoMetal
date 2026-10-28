@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Host instrument for drivers/NativeMetal/GpuScanoutPresenter.h: anonymous pages stand for the scanout and for the compositor's surface,
+// Host instrument for drivers/AdrenoMetal/GpuScanoutPresenter.h: anonymous pages stand for the scanout and for the compositor's surface,
 // the GPU copy runs on the native frontend's device (bridge over MoltenVK) and every pixel of the scanout is compared with the surface.
 // With NMB_SYSTEM_DEVICE=1 the Mac's own device runs the same code as the baseline. This is a host check of the copy's contract, not an
 // Adreno run and not the kernel presenter.

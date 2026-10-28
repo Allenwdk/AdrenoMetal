@@ -11,11 +11,14 @@
 #include <pthread.h>
 #include <dlfcn.h>
 #include <unistd.h>
+#include <pwd.h>
 #include <mach/mach.h>
 #include <objc/message.h>
 #include "NativeAdrenoUserTest.h"
 #include "NativeMetalBridgePhase.h"
 #include "CacheExport.h"
+#include "PrimeShaders.h"
+#include "ExceptionDiag.h"
 
 @interface _MTLDevice : NSObject
 @end
@@ -133,7 +136,9 @@ static void reportDisplayState(Gpu &gpu) {
         markSample(gpu, now, 0xA000);
     } @catch (NSException *) {}
 }
-// Whether NativeAdrenoMetal.clients names this process (names separated by blanks, commas or new lines; "*" names every process).
+// Whether NativeAdrenoMetal.clients names this process (names separated by blanks, commas or new lines; "*" names every process; a
+// name that ends in "*" names every process whose name starts with it, so "com.apple.WebKit.*" covers the WebContent, Networking
+// and GPU service processes).
 static bool listedClient() {
     char path[1024];
     if (!requestedPath("NativeAdrenoMetal.clients", path, sizeof path)) return false;
@@ -144,16 +149,29 @@ static bool listedClient() {
     fclose(file);
     text[length] = 0;
     const char *self = getprogname();
-    for (char *save = nullptr, *name = strtok_r(text, " ,\t\r\n", &save); name; name = strtok_r(nullptr, " ,\t\r\n", &save))
+    for (char *save = nullptr, *name = strtok_r(text, " ,\t\r\n", &save); name; name = strtok_r(nullptr, " ,\t\r\n", &save)) {
         if (!strcmp(name, "*") || !strcmp(name, self)) return true;
+        const size_t nameLength = strlen(name);
+        if (nameLength && name[nameLength - 1] == '*' && !strncmp(name, self, nameLength - 1)) return true;
+    }
     return false;
 }
 // A listed process other than the render server: the same runtime on its own connection, with none of the render server's threads (no
 // display hand-off, telemetry, benchmark or cache export). Its shader cache lives in its own cache or temp directory.
+// The reason a client's device failed, as a text line the driver keeps per process (the render server's report row is rewritten every ten seconds):
+// "<step> <detail>", through the marker stream (a connection is not needed). The Gpu object is made only on this path.
+static unsigned gClientPort;
+static void clientFailure(unsigned port, const char *step, const char *detail) {
+    if (Gpu *gpu = makeGpu(port)) {
+        char text[64];
+        snprintf(text, sizeof text, "%.14s %.46s", step, detail ? detail : "");
+        streamText(*gpu, text);
+    }
+}
 static id clientDevice(unsigned port) {
     if (!listedClient()) return nil;
     char turnip[1024];
-    if (!turnip::libraryPath(turnip, sizeof turnip) || access(turnip, R_OK) != 0) return nil;
+    if (!turnip::libraryPath(turnip, sizeof turnip) || access(turnip, R_OK) != 0) {clientFailure(port, "no-turnip", ""); return nil;}
     uint64_t registryID = 0;
     if (void *iokit = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW | RTLD_LOCAL)) {
         if (auto retain = (int (*)(unsigned))dlsym(iokit, "IOObjectRetain")) retain(port);
@@ -165,16 +183,31 @@ static id clientDevice(unsigned port) {
     if (!confstr(_CS_DARWIN_USER_CACHE_DIR, candidates[0], sizeof candidates[0] - 16)) candidates[0][0] = 0;
     if (!confstr(_CS_DARWIN_USER_TEMP_DIR, candidates[1], sizeof candidates[1] - 16)) candidates[1][0] = 0;
     id device = nil;
+    const char *lastError = "";
+    unsigned usable = 0;
     for (unsigned i = 0; i < 2 && !device; ++i) {
         if (!candidates[i][0]) continue;
         strlcat(candidates[i], "m2v", sizeof candidates[i]);
         mkdir(candidates[i], 0700);
         if (access(candidates[i], W_OK) != 0) continue;
+        ++usable;
         @try {
             device = native_bridge_metal_open(turnip, candidates[i], registryID, nullptr);
         } @catch (NSException *exception) {
             device = nil;
+            lastError = "exception";
         }
+        if (!device && !lastError[0]) lastError = nmb_last_error();
+    }
+    if (!device) clientFailure(port, usable ? "no-device" : "no-cachedir", lastError);
+    // The client's first problem, once, on the same text line, sent from the thread that hit it: WidgetRenderer crashed on a nil render
+    // encoder with no reason anywhere readable (its own log lines need the plugin's format strings, which the device does not keep), and a
+    // once-a-second reader never ran before the crash (i568).
+    if (device) {
+        gClientPort = port;
+        native_bridge_metal_problem_hook = [](const char *problem) {clientFailure(gClientPort, "problem", problem);};
+        char problem[200] = {};
+        if (native_bridge_metal_first_problem(problem, sizeof problem) && problem[0]) clientFailure(port, "problem", problem);
     }
     return device;
 }
@@ -184,6 +217,12 @@ static id deviceForPort(unsigned port) {
     @synchronized([NativeAdrenoMetalDeviceBase class]) {
         if (tried) return device;
         tried = true;
+        exceptiondiag::start(); // the throw site of an uncaught exception, for the kernel's THROW row (ExceptionDiag.h)
+        // No concurrent binning in any Metal process: with it BV ran ahead of BR and the two stopped waiting on each other inside a pass
+        // (int-261p, int-262, and in system memory int-265). Without it Turnip's autotune picks tile memory (GMEM) or system memory per
+        // pass: i553 forced system memory for every pass, the GPU busy 19 % at 680 MHz. A tile store writes whole 16x4 blocks, which the
+        // runtime keeps within a texture's rows (bridge patch 0016).
+        setenv("TU_DEBUG", "nocb", 0);
         if (strcmp(getprogname(), "backboardd") != 0) return device = clientDevice(port);
         // The discovery releases the accelerator port when it is done; the monitor and the scanout client keep using it.
         if (void *iokit = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW | RTLD_LOCAL)) {
@@ -229,12 +268,22 @@ static id deviceForPort(unsigned port) {
         setenv("METAL2VULKAN_LOG_PIPELINES", "1", 0);
         CFPreferencesSetAppValue(CFSTR("CAEnableFramebufferCompression"), kCFBooleanFalse, kCFPreferencesCurrentApplication);
         CFPreferencesSetAppValue(CFSTR("CAEnableIOSurfaceCompression"), kCFBooleanFalse, kCFPreferencesCurrentApplication);
-        char candidates[4][512] = {};
+        char candidates[5][512] = {};
         if (!confstr(_CS_DARWIN_USER_CACHE_DIR, candidates[0], sizeof candidates[0] - 16)) candidates[0][0] = 0;
         if (!confstr(_CS_DARWIN_USER_TEMP_DIR, candidates[1], sizeof candidates[1] - 16)) candidates[1][0] = 0;
         strlcpy(candidates[2], "/tmp/", sizeof candidates[2]);
         strlcpy(candidates[3], "/private/var/tmp/", sizeof candidates[3]);
-        for (unsigned i = 0; i < 4 && !device; ++i) {
+        // The user temp directory of the mobile user is under /var/mobile/tmp, which launchd's boot task dirs_cleaner empties at every boot,
+        // so with a persistent Data store the pipelines were still compiled again each boot (V row hit0). Try the user's Library/Caches first
+        // (marker 0x6814); the earlier candidates keep their markers.
+        if (const passwd *user = getpwuid(getuid()); user && user->pw_dir && user->pw_dir[0]) {
+            snprintf(candidates[4], sizeof candidates[4] - 16, "%s/Library/Caches/com.apple.backboardd", user->pw_dir);
+            mkdir(candidates[4], 0700);
+            strlcat(candidates[4], "/", sizeof candidates[4]);
+        }
+        static const unsigned order[] = {4, 0, 1, 2, 3};
+        for (unsigned i : order) {
+            if (device) break;
             if (!candidates[i][0]) continue;
             strlcat(candidates[i], "m2v", sizeof candidates[i]);
             mkdir(candidates[i], 0700);
@@ -291,16 +340,6 @@ static id deviceForPort(unsigned port) {
             }
             return nullptr;
         }, gpu);
-        // The fixed CPU/memory/pipeline workload of native_bridge_metal_benchmark, once while the render server starts, against the host's run
-        // of the same (pipeline_timing_host draw=2): how much slower the tablet is, and where. Its second run on the desktop (150 s later) fell
-        // inside the user's testing and competed with the UI for the GPU (int-154), so it is gone.
-        pthread_t benchmark;
-        pthread_create(&benchmark, &attributes, [](void *arg) -> void * {
-            id dev = (__bridge id)arg;
-            sleep(3);
-            native_bridge_metal_benchmark(dev, "/System/Library/Frameworks/QuartzCore.framework/default.metallib", 8, nullptr, 0);
-            return nullptr;
-        }, (__bridge void *)device);
         pthread_t telemetry;
         pthread_create(&telemetry, &attributes, [](void *arg) -> void * {
             Gpu *g = static_cast<Gpu *>(arg);
@@ -338,11 +377,28 @@ static id deviceForPort(unsigned port) {
             }
             return nullptr;
         }, gpu);
-        pthread_t exporter;
-        pthread_create(&exporter, &attributes, [](void *arg) -> void * {
-            cacheexport::run(*static_cast<Gpu *>(arg), gCacheDirectory);
+        // The cache directory's export to the UFS log only when NativeAdrenoMetal.cacheexport sits beside the bundle: Data persists across
+        // boots now, so the caches no longer need the trip through the host, and once priming has filled the directory, every rescan and
+        // export competed with the render server (int-245: the scanning thread at 45% CPU, the sending one at 48%, frames twice as slow).
+        char exportPath[1024];
+        if (requestedPath("NativeAdrenoMetal.cacheexport", exportPath, sizeof exportPath)) {
+            pthread_t exporter;
+            pthread_create(&exporter, &attributes, [](void *arg) -> void * {
+                cacheexport::run(*static_cast<Gpu *>(arg), gCacheDirectory);
+                return nullptr;
+            }, gpu);
+        }
+        // Every Metal library of the OS through the runtime, 90 s after the render server opened the device (PrimeShaders.h); the boots that froze
+        // or crashed before three minutes never primed anything. Progress is kept in the Data cache directory, so later boots resume.
+        // The translator recurses deeply on large functions: give it the stack of a main thread.
+        pthread_attr_setstacksize(&attributes, 8u << 20);
+        pthread_t primer;
+        pthread_create(&primer, &attributes, [](void *) -> void * {
+            char list[1024];
+            prime::run((id<MTLDevice>)device, gCacheDirectory, 90,
+                       requestedPath("NativeAdrenoMetal.primelist", list, sizeof list) ? std::string(list) : std::string());
             return nullptr;
-        }, gpu);
+        }, nullptr);
         pthread_attr_destroy(&attributes);
         gpu->mark(0x6803);
         return device;
