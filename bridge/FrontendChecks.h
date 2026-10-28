@@ -15,6 +15,13 @@
 #include <cstring>
 #include <vector>
 
+/* The runtime's MTLSharedEvent implements this selector, but the iOS 17 SDK no
+ * longer publishes it in the public Metal protocol; the device check uses it to
+ * prove a CPU wait on a GPU signal. */
+@protocol NativeFrontendSharedEvent <MTLSharedEvent>
+- (BOOL)waitUntilSignaledValue:(uint64_t)value timeoutMS:(uint32_t)timeoutMS;
+@end
+
 namespace frontendchecks {
 struct Report {
     unsigned failed, last;
@@ -379,7 +386,7 @@ static void run(id<MTLDevice> device, id<MTLLibrary> library, id<MTLLibrary> fcL
                 }
                 CHECK(!dispatch_semaphore_wait(notified, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC)) && heard >= 3,
                       "listener notification %llu", (unsigned long long)heard);
-                CHECK([event waitUntilSignaledValue:3 timeoutMS:10], "waitUntilSignaledValue");
+                CHECK([(id<NativeFrontendSharedEvent>)event waitUntilSignaledValue:3 timeoutMS:10], "waitUntilSignaledValue");
             }
         }
         step(r, 0x660b);
