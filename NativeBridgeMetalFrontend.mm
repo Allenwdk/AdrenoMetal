@@ -1232,9 +1232,10 @@ extern "C" void NBWaitInFlight(uint64_t beforeUs);
  gTimeWaitScheduled.add(began);
 }
 @end
-// The scanout client: before it copies an offered frame, the GPU work committed up to then must be done.
+// The scanout client: before it uses an offered frame (copies it, or reports it to the display's direct path, which flips on that
+// answer), the GPU work committed up to then must be done. This is the fence the display cannot build by itself: the compositor
+// submits its swap before the frame's GPU work retires (the early-completion experiment showed it with the blur passes).
 extern "C" void NBWaitInFlight(uint64_t beforeUs) {
- if(!earlyOn())return;
  NSArray *pending;@synchronized(gInFlight){pending=gInFlight.allObjects;}
  for(NBCommandBuffer *commandBuffer in pending)
   if(commandBuffer.committed && !commandBuffer.failedLocally && commandBuffer.committedUs<=beforeUs)nmb_command_buffer_wait(commandBuffer.handle,0);
@@ -1982,6 +1983,38 @@ extern "C" size_t native_bridge_metal_benchmark(id device,const char *metallib,u
  }
  return at;
 }
+// The GPU's own throughput, measured once: one 3200x2136 frame's bytes filled and then copied on this device. The compositor's frame
+// time has never had a reference, so a fill or copy that is far below what the device does here points at the stack, and one that is
+// close points at the work itself.
+static char gThroughput[96];
+static void measureThroughput(id device) {
+ if(!device)return;
+ id<MTLDevice> dev=(id<MTLDevice>)device;
+ (void)dev;
+ const size_t bytes=(size_t)3200*2136*4;   // in this format one scanout frame
+ id<MTLBuffer> a=[(id<MTLDevice>)device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
+ id<MTLBuffer> b=[(id<MTLDevice>)device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
+ id<MTLCommandQueue> q=[(id<MTLDevice>)device newCommandQueue];
+ if(!a || !b || !q) {snprintf(gThroughput,sizeof gThroughput,"B no resource");return;}
+ auto us=[]{return clock_gettime_nsec_np(CLOCK_UPTIME_RAW)/1000;};
+ uint64_t fill=UINT64_MAX,move=UINT64_MAX;
+ for(unsigned i=0;i<4;++i) {
+  const uint64_t t=us();
+  id<MTLCommandBuffer> c=[q commandBuffer];id<MTLBlitCommandEncoder> e=[c blitCommandEncoder];
+  [e fillBuffer:a range:NSMakeRange(0,bytes) value:(uint8_t)(i*37)];[e endEncoding];[c commit];[c waitUntilCompleted];
+  const uint64_t took=us()-t;if(took<fill)fill=took;
+ }
+ for(unsigned i=0;i<4;++i) {
+  const uint64_t t=us();
+  id<MTLCommandBuffer> c=[q commandBuffer];id<MTLBlitCommandEncoder> e=[c blitCommandEncoder];
+  [e copyFromBuffer:a sourceOffset:0 toBuffer:b destinationOffset:0 size:bytes];[e endEncoding];[c commit];[c waitUntilCompleted];
+  const uint64_t took=us()-t;if(took<move)move=took;
+ }
+ snprintf(gThroughput,sizeof gThroughput,"B fill=%lluMB/s copy=%lluMB/s (27MB, %llu/%lluus)",
+  (unsigned long long)(fill!=UINT64_MAX && fill?bytes/(fill?fill:1)*1000000>>20:0),
+  (unsigned long long)(move!=UINT64_MAX && move?2*bytes/(move?move:1)*1000000>>20:0),
+  (unsigned long long)(fill==UINT64_MAX?0:fill),(unsigned long long)(move==UINT64_MAX?0:move));
+}
 // The telemetry table the plugin streams to the kernel's log: newline-separated rows of at most 90 characters.
 extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
  size_t at=0;out[0]=0;
@@ -1990,6 +2023,11 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
   if(at+(size_t)n+2>=size)return;memcpy(out+at,text,(size_t)n);at+=(size_t)n;out[at++]='\n';out[at]=0;};
  auto ms=[](uint64_t us){return (unsigned long long)(us/1000);};
  {std::lock_guard<std::mutex> lock(gBenchLock);for(unsigned r=0;r<4;r++)if(gBench[r][0])row("%.90s",gBench[r]);}
+ {   // once, on the third table (about 17 s in), after the first frames are on screen
+  static std::atomic<unsigned> calls{0};
+  if(gDeviceObject && calls.fetch_add(1)==2) measureThroughput(gDeviceObject);
+  if(gThroughput[0]) row("%.90s",gThroughput);
+ }
  row("S c%llu/%llu d%llu p%llu x%llu R%llu D%llu F%llu M%lluk C%llu B%llu",(unsigned long long)gCommits.load(),(unsigned long long)gCommitFailures.load(),
   (unsigned long long)gCompleted.load(),(unsigned long long)gPipelines.load(),(unsigned long long)gProblems.load(),(unsigned long long)gPasses.load(),
   (unsigned long long)gDraws.load(),(unsigned long long)gFullScreenPasses.load(),(unsigned long long)(gBiggestPass.load()>>10),

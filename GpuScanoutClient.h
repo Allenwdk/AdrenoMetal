@@ -31,6 +31,7 @@ struct Stats {
     uint64_t frames, failures, timeouts;
     int lastResult;     // gpupresent::Result of the last frame
     int step;           // 0 idle, 2 mode refused, 3 scanout not mappable/importable, 4 serving
+    int direct;         // 1: the display scans the surface itself (NGP_DIRECT); this client only fences the frame
     int error;          // the failing call's return, when there is one
     uint64_t verified;  // frames whose scanout was read back and compared with the surface
     uint64_t mismatchRows;   // rows of those frames that differ (CPU reads only: nothing is rendered or copied by the CPU)
@@ -48,8 +49,13 @@ public:
         note(0x6710);
         int status = transport_.call(transport_.context, NGP_METHOD_MODE, nullptr, 0, &mode, sizeof mode);
         note(0x6711);
-        if (status || mode.version != NGP_VERSION || mode.format != NGP_BGRX8888 || !mode.width || !mode.height ||
+        const bool direct = mode.format == NGP_DIRECT;
+        if (status || mode.version != NGP_VERSION || (mode.format != NGP_BGRX8888 && !direct) || !mode.width || !mode.height ||
             mode.stride < mode.width * 4 || mode.bytes < mode.stride * mode.height) return fail(2, status);
+        // Direct mode: the display flips its own pipes to the offered surface (no copy, no scanout mapping here). What it
+        // needs from this client is the one fact it cannot see - when the frame's GPU work finished - so serveOne waits for
+        // the render server's command buffers committed before the offer and then completes the frame.
+        if (direct) {stats_->direct = 1; stats_->step = 4; return true;}
         const size_t page = (size_t)getpagesize();
         uint64_t address = 0, length = 0;
         note(0x6712);
@@ -79,6 +85,17 @@ public:
             ++stats_->failures;
             stats_->error = status;
             return false;
+        }
+        if (stats_->direct) {
+            // Everything the render server committed before the offer is this frame's work; waiting for it is the fence.
+            const uint64_t offeredUs = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000;
+            if (NBWaitInFlight) NBWaitInFlight(offeredUs);
+            note(0x6731);
+            NGPComplete done = {swap.sequence, 0, 0};
+            const int completed = transport_.call(transport_.context, NGP_METHOD_COMPLETE_SWAP, &done, sizeof done, nullptr, 0);
+            if (completed) {++stats_->failures; stats_->error = completed; return false;}
+            ++stats_->frames; stats_->lastResult = 0;
+            return true;
         }
         const size_t page = (size_t)getpagesize();
         {   // measurement: the second half of the run copies half the rows

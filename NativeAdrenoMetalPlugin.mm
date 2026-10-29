@@ -108,6 +108,27 @@ static void markSample(Gpu &gpu, const DisplaySample &x, unsigned base) {
     gpu.mark((base + 0x1000) | (x.display >> 4));                 // display limits word: 0x200 compression support, 0x1c00 type
     gpu.mark((base + 0x2000) | (x.mode << 4) | x.behaviour);     // mode colour field, ICC/other behaviour bytes
 }
+// This display path takes plain 8-bit BGRA, but the render server picks its framebuffer format from its deep-framebuffer state,
+// which makes it render 34 MiB two-plane b3a8 surfaces (also what exhausted the 1 GiB window). Clear the global flag and the
+// display's bit before the render server creates the display surfaces; reportDisplayState's two-report experiment runs too late.
+static void clearDeepNow() {
+    void *start = dlsym(RTLD_DEFAULT, "CARenderServerStart");
+    Class serverClass = NSClassFromString(@"CAWindowServer");
+    if (!start || !serverClass) return;
+    const intptr_t slide = (intptr_t) start - 0x189651efc;
+    uint8_t zero = 0;
+    writeTask(0x1f491ae10 + slide, &zero, 1);
+    @try {
+        id server = ((id (*)(id, SEL)) objc_msgSend)(serverClass, NSSelectorFromString(@"serverIfRunning"));
+        NSArray *displays = server ? ((id (*)(id, SEL)) objc_msgSend)(server, NSSelectorFromString(@"displays")) : nil;
+        id first = displays.count ? displays[0] : nil;
+        DisplaySample sample = sampleDisplay(first, slide);
+        if (sample.object) {
+            uint32_t f = 0;
+            if (readTask(sample.object + 0x238, &f, 4) && (f & 8)) {f &= ~8u; writeTask(sample.object + 0x238, &f, 4);}
+        }
+    } @catch (NSException *) {}
+}
 static void reportDisplayState(Gpu &gpu) {
     ++gReports;
     static DisplaySample before;
@@ -400,6 +421,7 @@ static id deviceForPort(unsigned port) {
             return nullptr;
         }, nullptr);
         pthread_attr_destroy(&attributes);
+        clearDeepNow();
         gpu->mark(0x6803);
         return device;
     }
