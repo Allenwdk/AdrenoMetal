@@ -26,3 +26,8 @@ Slow encoding operations retain source lines and enqueue times. Completion handl
 ## iOS 27 Core Image resource loading
 
 The frontend retains Core Image's original `internalLibraryWithName:device:` result. If it is nil for this frontend's device, the iOS 27 adapter retries only the known `ci_stdlib`, `ci_filters`, `ci_raw` and stitchable variants at their standard framework paths through `newLibraryWithURL:error:`. These are the original OS libraries, parsed by the normal runtime. An absent or refused library remains nil with its real error recorded. No system binary, global VFS view or compiler pin changes. Hardware qualification is pending.
+
+
+## Uke 24A446 hardware result (2026-11-03)
+
+On release `2026-11-03-ipados27-gpu-coreimage-resources` (kernel CRC `90B6BC701210D9DB`), the user confirms prior boot, desktop/Settings icon and widget loading, and Settings/Dock UI-restart symptoms resolved. The scoped original-nil Core Image library retry uses original system resources through the normal loader; the earlier VFS source-union experiment is reverted. No instrumented latency, long-duration stress or repeated-cold-boot cache result is inferred.
