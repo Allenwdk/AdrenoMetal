@@ -188,6 +188,7 @@ static void streamText(Gpu &gpu, const char *text) {
     pthread_mutex_lock(&gStreamLock);
     gpu.mark(0x7fff);
     for (unsigned i = 0; i < 63 && text[i]; ++i) gpu.mark(0x7000 | (uint8_t)text[i]);
+    gpu.mark(0x7000); // Complete the existing marker text before a failing client exits.
     pthread_mutex_unlock(&gStreamLock);
 }
 

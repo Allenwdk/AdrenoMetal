@@ -4489,7 +4489,53 @@ static uint64_t askAnswer(SEL cmd,NSUInteger arg) {
 static NSUInteger countArgAnswer(id,SEL cmd,NSUInteger arg) {return (NSUInteger)askAnswer(cmd,arg);}
 static BOOL flagArgAnswer(id,SEL cmd,NSUInteger arg) {return askAnswer(cmd,arg)!=0;}
 static BOOL (*gFamilyAnswer)(id,SEL,NSInteger);
+// Core Image asks NSBundle for these sealed libraries before creating its DAG.
+// On the owner OS/SystemOS composition a bundle-resource miss may hide a file
+// that remains readable at its standard framework path. Keep the original
+// lookup first; retry only its nil result, for this device and known CI files.
+#if TARGET_OS_IPHONE
+// The 24A446 helper returns newLibraryWithURL: directly (+1), even though
+// its private selector is outside the usual new/copy method families.
+typedef id (*CoreImageLibraryBuilder)(id,SEL,NSString *,id<MTLDevice>) __attribute__((ns_returns_retained));
+static std::atomic<CoreImageLibraryBuilder> gCoreImageLibraryBuilder{nullptr};
+static std::atomic<bool> gCoreImageResourceHooked{false};
+static id coreImageLibraryWithName(id cls,SEL cmd,NSString *name,id<MTLDevice> device) __attribute__((ns_returns_retained));
+static id coreImageLibraryWithName(id cls,SEL cmd,NSString *name,id<MTLDevice> device) {
+ CoreImageLibraryBuilder original=gCoreImageLibraryBuilder.load(std::memory_order_acquire);
+ id library=original?original(cls,cmd,name,device):nil;
+ if(library || device!=gDeviceObject || ![name isKindOfClass:[NSString class]])return library;
+ static const char *const names[]={"ci_stdlib","ci_stdlib_h","ci_filters","ci_raw",
+                                  "ci_stdlib_stitchable","ci_stdlib_stitchable_h","ci_filters_stitchable","ci_raw_stitchable"};
+ bool known=false;
+ for(const char *candidate:names)if([name isEqualToString:@(candidate)]){known=true;break;}
+ if(!known)return nil;
+ NSString *path=[@"/System/Library/Frameworks/CoreImage.framework" stringByAppendingPathComponent:[name stringByAppendingPathExtension:@"metallib"]];
+ NSError *error=nil;
+ library=[device newLibraryWithURL:[NSURL fileURLWithPath:path] error:&error];
+ NBLOG(@"native-metal: CI %@ %@ e=%ld %@",library?@"recovered":@"refused",name,(long)error.code,error.localizedDescription?:path);
+ return library;
+}
+static void installCoreImageResourceFallback() {
+ if(gCoreImageResourceHooked.load(std::memory_order_acquire))return;
+ static const bool selected=[NSProcessInfo processInfo].operatingSystemVersion.majorVersion>=27;
+ if(!selected)return;
+ Class cls=objc_getClass("CIKernelLibrary");
+ if(!cls)return;   // Retry at the next device-family query after Core Image loads.
+ static std::mutex lock;
+ std::lock_guard<std::mutex> hold(lock);
+ if(gCoreImageResourceHooked.load(std::memory_order_relaxed))return;
+ Method method=class_getClassMethod(cls,sel_registerName("internalLibraryWithName:device:"));
+ if(!method)return;
+ gCoreImageLibraryBuilder.store((CoreImageLibraryBuilder)method_getImplementation(method),std::memory_order_release);
+ method_setImplementation(method,(IMP)coreImageLibraryWithName);
+ gCoreImageResourceHooked.store(true,std::memory_order_release);
+}
+#else
+static void installCoreImageResourceFallback() {}
+#endif
+
 static BOOL familyForCaller(id self,SEL _cmd,NSInteger family) {
+ installCoreImageResourceFallback();
  if(family>=1003 && family<2000) {   // MTLGPUFamilyApple3 and up
   Dl_info caller;
   if(dladdr(__builtin_return_address(0),&caller) && caller.dli_fname && strstr(caller.dli_fname,"/RenderBox.framework/"))return NO;
@@ -4521,6 +4567,7 @@ static void installAnswers(Class cls) {
 }
 
 extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint64_t registryID,void (*missing)(const char *,const char *)) {
+ installCoreImageResourceFallback();
  if(gDeviceObject)return gDeviceObject;
  gMissing=missing;gInFlight=[NSMutableSet set];
  if(cache && *cache)configureShaderDiskCache(cache);
