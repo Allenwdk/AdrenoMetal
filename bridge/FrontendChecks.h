@@ -15,6 +15,11 @@
 #include <cstring>
 #include <vector>
 
+// The runtime implements this public selector; older SDK headers omit it.
+@protocol FrontendChecksSharedEventWait <MTLSharedEvent>
+- (BOOL)waitUntilSignaledValue:(uint64_t)value timeoutMS:(uint64_t)milliseconds;
+@end
+
 namespace frontendchecks {
 struct Report {
     unsigned failed, last;
@@ -379,7 +384,7 @@ static void run(id<MTLDevice> device, id<MTLLibrary> library, id<MTLLibrary> fcL
                 }
                 CHECK(!dispatch_semaphore_wait(notified, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC)) && heard >= 3,
                       "listener notification %llu", (unsigned long long)heard);
-                CHECK([event waitUntilSignaledValue:3 timeoutMS:10], "waitUntilSignaledValue");
+                CHECK([(id<FrontendChecksSharedEventWait>)event waitUntilSignaledValue:3 timeoutMS:10], "waitUntilSignaledValue");
             }
         }
         step(r, 0x660b);
