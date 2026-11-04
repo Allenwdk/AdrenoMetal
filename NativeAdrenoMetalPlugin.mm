@@ -239,12 +239,21 @@ static id deviceForPort(unsigned port) {
         // command buffer was no better (17.8 ms mean and 56.1 ms at p95 in tile memory, 17.1 and 52.1 in system memory), and one home screen frame
         // still came out with red and blue exchanged. sheng-tu-debug= overrides this for experiments.
         setenv("TU_DEBUG", bootArgSet("sheng-fb-bgra=1") ? "sysmem,nocb" : "nocb", 0);
-        // sheng-diag=1 turns on every diagnostic of the GPU stack in this process: the frontend's frame trace, Turnip's pass stamps and
-        // submission ring, the runtime's stage ring, and in the render server the status and telemetry lines. Without it none of them runs.
-        if (bootArgSet("sheng-diag=1") || bootArgSet("sheng-gpu-trace=1")) setenv("SHENG_DIAG", "1", 1);
+        // Mode 2 keeps frontend frame timing while Turnip and the runtime use their normal unstamped path.
+        // The kernel reads sheng-gpu-trace independently.
+        const bool frameTimingOnly = bootArgSet("sheng-diag=2");
+        const bool gpuTrace = bootArgSet("sheng-gpu-trace=1");
+        if (frameTimingOnly) setenv("SHENG_FRAME_TIMING", "1", 1);
+        else unsetenv("SHENG_FRAME_TIMING");
+        if (!frameTimingOnly && (bootArgSet("sheng-diag=1") || gpuTrace)) setenv("SHENG_DIAG", "1", 1);
         else unsetenv("SHENG_DIAG");
-        if (bootArgSet("sheng-gpu-trace=1")) setenv("SHENG_GPU_TRACE", "1", 1);
+        if (!frameTimingOnly && gpuTrace) setenv("SHENG_GPU_TRACE", "1", 1);
         else unsetenv("SHENG_GPU_TRACE");
+        // The measured full-screen transient layout benefits from GMEM on uke.
+        if (frameTimingOnly && bootArgSet("sheng-gpu-trace=2"))
+            setenv("NATIVE_METAL_TRANSIENT_GMEM", "1", 1);
+        else unsetenv("NATIVE_METAL_TRANSIENT_GMEM");
+        unsetenv("NATIVE_METAL_TRANSIENT_SYSMEM_AB");
         if (bootArgSet("sheng-wallpaper-freeze=1")) setenv("NATIVE_METAL_FREEZE_WALLPAPER", "1", 1);
         // log-gpu=1: the GPU stack's log lines (NSLog, the pipeline journal); off without it.
         if (bootArgSet("log-gpu=1")) setenv("SHENG_LOG_GPU", "1", 1);

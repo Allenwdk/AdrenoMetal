@@ -56,6 +56,19 @@ extern "C" void sys_dcache_flush(void *start, size_t length);
 static NmbDevice *gDevice;
 static std::string gLoaderPath;   // the Turnip library the runtime loaded (its own handle is local to it)
 static id gDeviceObject;
+static void (*gSetRenderMode)(char);
+enum class TransientRenderPolicy { Default, Gmem, Compare };
+static TransientRenderPolicy gTransientRenderPolicy;
+static thread_local char tRenderMode;
+struct ScopedRenderMode {
+ char previous=0;bool active=false;
+ explicit ScopedRenderMode(char mode) {
+  if(!mode || !gSetRenderMode)return;
+  previous=tRenderMode;active=true;
+  gSetRenderMode(mode);tRenderMode=mode;
+ }
+ ~ScopedRenderMode(){if(active){gSetRenderMode(previous);tRenderMode=previous;}}
+};
 static bool (*gFrameTransport)(uint32_t,const void *,uint32_t);
 static std::atomic<uint64_t> gFrameNumber{0};
 // The kernel trace (sheng-gpu-trace=1) takes only the identities of the render, encode and completion threads, which the kernel's
@@ -212,8 +225,8 @@ static std::atomic<uint32_t> gAskFg{0xffffffffu},gAskBg{0xffffffffu},gAskCount{0
 static bool nbForwardPriority(uint32_t foreground,uint32_t background);
 static NBQueuePriorities gQueuePriorities;
 static std::mutex gPriorityLock;
-// Every diagnostic of this process (the frame trace, the sampler, Turnip's pass stamps and submission ring, the runtime's stage ring) runs only
-// with SHENG_DIAG set, which the plugin sets from the boot argument sheng-diag=1 before the device opens (NativeAdrenoMetalPlugin.mm).
+// The plugin sets the diagnostic environment before opening the device. Frame timing alone does
+// not enable the runtime or Turnip diagnostic rings.
 static bool diagOn() {static const bool on=getenv("SHENG_DIAG")!=nullptr;return on;}
 static uint32_t threadCpuUs() {
  thread_basic_info_data_t info;mach_msg_type_number_t count=THREAD_BASIC_INFO_COUNT;
@@ -221,7 +234,10 @@ static uint32_t threadCpuUs() {
  return (uint32_t)((uint64_t)(info.user_time.seconds+info.system_time.seconds)*1000000ull+(uint64_t)(info.user_time.microseconds+info.system_time.microseconds));
 }
 static uint32_t threadIdLow() {uint64_t id=0;pthread_threadid_np(NULL,&id);return (uint32_t)id;}
-static bool traceWanted() {static const bool on=diagOn() && !strcmp(getprogname(),"backboardd");return on;}
+static bool traceWanted() {
+ static const bool on=(diagOn() || getenv("SHENG_FRAME_TIMING")!=nullptr) && !strcmp(getprogname(),"backboardd");
+ return on;
+}
 static void tracePush(const TraceRec &rec) {
  if(!traceWanted())return;
  if(rec.type==12 && (rec.a>=40 || !native_gpu_latency_stage(rec.a)))return;
@@ -250,8 +266,8 @@ static void traceThread(uint32_t role) {
 }
 // Types 14/15 persist CPU-side phases beside runtime stages in frames.trace.
 static void frontStage(uint64_t command,uint64_t commit,uint32_t phase,uint64_t bytes=0,uint32_t surfaces=0) {
- if(!diagOn())return;
- uint64_t tid=0;pthread_threadid_np(nullptr,&tid);
+ if(!diagOn() && (!traceWanted() || (phase!=2 && phase!=3)))return;
+ uint64_t tid=0;if(diagOn())pthread_threadid_np(nullptr,&tid);
  TraceRec rec={};rec.type=15;rec.t0=nowUs();rec.t1=command;rec.t2=commit;rec.t3=tEncodeBatchId;
  rec.a=phase;rec.b=(uint32_t)tid;rec.c=surfaces;rec.d=(uint32_t)(bytes>>10);tracePush(rec);
 }
@@ -307,6 +323,7 @@ struct DetailSpan {
  ~DetailSpan(){if(id){uint64_t end=nowUs();if(announced || end-began>=250)detailPoint(id,kind,2,command,object,function,began,parent,0,0,end);}}
 };
 static uint64_t encodeCommandOf(id);
+static char encodeRenderModeOf(id);
 static void traceStartWriter();
 // type 5 swap served by the scanout client: {idx, t0 offer arrived, t1 GPU copy returned, t2 swap completed, a sequence, b result}
 extern "C" void NBTraceSwap(uint64_t offered,uint64_t copied,uint64_t completed,uint32_t sequence,uint32_t result) {
@@ -342,7 +359,7 @@ static void traceStartWriter() {
  // records overwrote each other's at their own offsets (untagged-3f2bd680: SpringBoard's header, two interleaved stage sequences).
  // Only the render server writes the file; no other process reads its Turnip rings.
  static const bool render=!strcmp(getprogname(),"backboardd");
- if(!diagOn() || !render)return;
+ if(!traceWanted())return;
  bool expected=false;
  if(!gTraceStarted.compare_exchange_strong(expected,true))return;
  std::thread([]{
@@ -364,7 +381,7 @@ static void traceStartWriter() {
    usleep(250000);
    if(render && fd<0)for(const char *path:paths){fd=open(path,O_WRONLY|O_CREAT|O_TRUNC,0644);if(fd>=0)break;}
    if(render && fd<0)continue;
-   if(!turnip && !gLoaderPath.empty()) {   // the runtime loads Turnip after this thread may have started
+   if(diagOn() && !turnip && !gLoaderPath.empty()) {   // the runtime loads Turnip after this thread may have started
     turnip=dlopen(gLoaderPath.c_str(),RTLD_NOW|RTLD_NOLOAD);
     if(turnip) {
      passRead=(uint32_t (*)(uint32_t,PassRec *,uint32_t,uint32_t *))dlsym(turnip,"tu_pass_ring_read");
@@ -420,7 +437,7 @@ static void traceStartWriter() {
      if(n<64)break;
     }
    }
-   {
+   if(diagOn()) {
     struct StageRec {uint64_t ns,id;uint32_t seq;uint16_t stage,arg;};
     static_assert(sizeof(StageRec)==24,"stage record");
     static uint64_t stageFrom=0;
@@ -1853,6 +1870,7 @@ struct SingleSampleCopy {
 };
 @interface NBEncoder : NBObject
 @property(nonatomic) NmbEncoder *handle;
+@property(nonatomic) char renderMode;
 @property(nonatomic,strong) NBCommandBuffer *commandBuffer;
 @property(nonatomic) std::vector<SingleSampleCopy> resolveCopies;
 @property(nonatomic,strong) NSMutableArray *dumpEntries;   // its NATIVE_METAL_DUMP_CB targets, given its label at endEncoding
@@ -1991,8 +2009,19 @@ struct EncodeThread {
  std::condition_variable work,idle;
  std::deque<EncodeBatch *> batches;
  std::vector<EncodeBatch *> spare;
+ std::vector<uint64_t> drainTargets;
  uint64_t queued=0,done=0;
 };
+// Called under lock after a batch completes. A drain waits for a queued prefix,
+// so earlier batches need not wake it. Retain vector capacity between drains.
+static bool encodeCompletePrefix(EncodeThread &t) {
+ ++t.done;
+ const auto end=t.drainTargets.end();
+ const auto pending=std::remove_if(t.drainTargets.begin(),end,[&](uint64_t target){return target<=t.done;});
+ if(pending==end)return false;
+ t.drainTargets.erase(pending,end);
+ return true;
+}
 static thread_local bool tOnEncodeThread;
 static thread_local EncodeBatch *tBatch;
 // The encoding thread does the render server's frame work for CoreAnimation's render thread, so it runs at that thread's scheduling
@@ -2029,7 +2058,8 @@ static EncodeThread &encodeThread() {
     batchStage(batch->serial,2,batch->enqueuedUs,tasks,depth);
     @autoreleasepool {batch->run();}
     batchStage(batch->serial,3,batch->enqueuedUs,tasks,depth);tEncodeBatchId=0;
-    lock.lock();t.spare.push_back(batch);t.done++;t.idle.notify_all();
+    lock.lock();t.spare.push_back(batch);
+    if(encodeCompletePrefix(t)){t.idle.notify_all();batchStage(batch->serial,4,batch->enqueuedUs,0,0);}
    }
    return nullptr;
   },t);
@@ -2042,14 +2072,15 @@ static bool onEncodeQueue() {return tOnEncodeThread;}
 static void encodeFlush() {
  if(!tBatch || !tBatch->count)return;
  EncodeThread &t=encodeThread();
- uint64_t serial,queuedUs;uint32_t tasks,depth;
+ uint64_t serial,queuedUs;uint32_t tasks,depth;bool wake;
  {std::lock_guard<std::mutex> lock(t.lock);
   tBatch->serial=serial=++t.queued;tBatch->enqueuedUs=queuedUs=nowUs();
   tasks=(uint32_t)tBatch->count;depth=(uint32_t)t.batches.size();
+  wake=t.batches.empty();
   t.batches.push_back(tBatch);tBatch=nullptr;
  }
  batchStage(serial,1,queuedUs,tasks,depth);
- t.work.notify_one();
+ if(wake)t.work.notify_one();
 }
 // A closure takes what it uses by value (C arrays as std::array) or strongly (the objects whose handles it passes), as the call made it.
 template<class F> static void encodeLaterRaw(F &&work) {
@@ -2068,6 +2099,8 @@ static void encodeDrain() {
  EncodeThread &t=encodeThread();
  std::unique_lock<std::mutex> lock(t.lock);
  const uint64_t target=t.queued;
+ if(t.done>=target)return;
+ if(std::find(t.drainTargets.begin(),t.drainTargets.end(),target)==t.drainTargets.end())t.drainTargets.push_back(target);
  t.idle.wait(lock,[&]{return t.done>=target;});
 }
 template<class F> struct TracedEncodeCall {
@@ -2090,7 +2123,7 @@ template<class F> static void encodeLater(F &&work,const char *label,uint32_t li
  encodeLaterRaw(TracedEncodeCall<Closure>{std::optional<Closure>(std::forward<F>(work)),label,line,
                 ++gDetailSequence,command,0,nowUs()});
 }
-#define ENCODE(...) encodeLater([=]{__VA_ARGS__;},__func__,__LINE__,diagOn()?encodeCommandOf(self):0)
+#define ENCODE(...) encodeLater([=]{ScopedRenderMode renderMode(encodeRenderModeOf(self));__VA_ARGS__;},__func__,__LINE__,diagOn()?encodeCommandOf(self):0)
 // Held while a resource wait reads an in-flight command buffer's runtime handle and while a locally refused command buffer frees it.
 static std::mutex gRuntimeHandleLock;
 static void waitForResource(id resource) {
@@ -2151,6 +2184,10 @@ static uint64_t encodeCommandOf(id object) {
  if([object isKindOfClass:[NBCommandBuffer class]])return ((NBCommandBuffer *)object)->traceNumber;
  if([object isKindOfClass:[NBEncoder class]])return ((NBEncoder *)object).commandBuffer->traceNumber;
  return 0;
+}
+static char encodeRenderModeOf(id object) {
+ if(gTransientRenderPolicy==TransientRenderPolicy::Default)return 0;
+ return [object isKindOfClass:[NBEncoder class]]?((NBEncoder *)object).renderMode:0;
 }
 @implementation NBEncoder {
  std::unique_ptr<DrawStateNote> _drawNote;
@@ -2847,7 +2884,7 @@ static char kUserDictionaryKey;
 - (void)setResponsibleTaskIDs:(const void *)ids count:(NSUInteger)count {(void)ids;(void)count;}
 - (instancetype)init {
  if((self=[super init])){_scheduledHandlers=[NSMutableArray array];_completedHandlers=[NSMutableArray array];_surfaces=[NSMutableSet set];_resourceOwners=[NSMutableSet set];_handlers=dispatch_group_create();_schedulingHandlers=dispatch_group_create();}
- if(self){traceNumber=++gFrameNumber;createdUs=nowUs();createCpu=threadCpuUs();createTid=threadIdLow();earlyEligible=onRenderServerThread();if(earlyEligible){pthread_t none=nullptr;gEncodeReference.compare_exchange_strong(none,pthread_self());traceThread(1);}frontStage(traceNumber,0,1);}
+ if(self){traceNumber=++gFrameNumber;createdUs=nowUs();createCpu=diagOn()?threadCpuUs():0;createTid=diagOn()?threadIdLow():0;earlyEligible=onRenderServerThread();if(earlyEligible){pthread_t none=nullptr;gEncodeReference.compare_exchange_strong(none,pthread_self());traceThread(1);}frontStage(traceNumber,0,1);}
  return self;
 }
 - (void)dealloc {DetailSpan timing(17,(uintptr_t)_handle);nmb_command_buffer_release(_handle);}
@@ -3042,7 +3079,36 @@ static char kUserDictionaryKey;
   pass.visibility=[(NBBuffer *)d.visibilityResultBuffer handle];
  }
  NmbCommandBuffer *handle=_handle;
- id<MTLRenderCommandEncoder> made=[self encoder:[NBRenderEncoder new] make:^{return nmb_render_encoder_new(handle,&pass);} what:@"renderCommandEncoder"];
+ NBRenderEncoder *encoder=[NBRenderEncoder new];
+ if(gTransientRenderPolicy!=TransientRenderPolicy::Default) {
+  id<MTLTexture> target=d.colorAttachments[0].texture;
+  bool eligible=target && [(id)target isKindOfClass:[NBTexture class]] && ((NBTexture *)target).surface &&
+      target.pixelFormat==MTLPixelFormatBGRA8Unorm && target.sampleCount==1 &&
+      (uint64_t)target.width*target.height>=2000000 && d.renderTargetArrayLength<=1 &&
+      (!d.renderTargetWidth || d.renderTargetWidth==target.width) &&
+      (!d.renderTargetHeight || d.renderTargetHeight==target.height) &&
+      !d.depthAttachment.texture && !d.stencilAttachment.texture &&
+      !d.colorAttachments[0].resolveTexture && d.colorAttachments[0].loadAction==MTLLoadActionLoad &&
+      d.colorAttachments[0].storeAction==MTLStoreActionStore;
+  unsigned transient=0;
+  for(unsigned i=1;eligible && i<8;++i) {
+   auto *a=d.colorAttachments[i];
+   if(!a.texture)continue;
+   eligible=a.texture.storageMode==MTLStorageModeMemoryless && a.texture.sampleCount==1 &&
+       a.texture.width==target.width && a.texture.height==target.height &&
+       a.loadAction==MTLLoadActionDontCare && a.storeAction==MTLStoreActionDontCare && !a.resolveTexture;
+   ++transient;
+  }
+  if(eligible && transient) {
+   // Uke readback favors GMEM for this attachment layout. Keep the measured
+   // comparison available explicitly, without allocating SYSMEM backing by default.
+   encoder.renderMode=gTransientRenderPolicy==TransientRenderPolicy::Compare && (traceNumber&1)?'s':'g';
+   TraceRec rec{};rec.type=23;rec.t0=nowUs();rec.t1=traceNumber;rec.t2=_dumpPasses;
+   rec.a=(uint32_t)encoder.renderMode;rec.b=(uint32_t)target.width;rec.c=(uint32_t)target.height;rec.d=transient;
+   tracePush(rec);
+  }
+ }
+ id<MTLRenderCommandEncoder> made=[self encoder:encoder make:^{return nmb_render_encoder_new(handle,&pass);} what:@"renderCommandEncoder"];
  if(made) {
   ((NBRenderEncoder *)made).resolveCopies=std::move(resolveCopies);
   id<MTLTexture> t0=d.colorAttachments[0].texture;
@@ -3156,7 +3222,7 @@ static char kUserDictionaryKey;
  if(self.committed){NBLOG(@"native-metal: commit twice");return;}
  self.committed=YES;
  self.committedUs=nowUs();
- commitCpu=threadCpuUs();commitTid=threadIdLow();
+ commitCpu=diagOn()?threadCpuUs():0;commitTid=diagOn()?threadIdLow():0;
  {
   std::lock_guard<std::mutex> lock(gCommitLock);
   // Assign once under the same lock as publication. A concurrent commit cannot reuse this index.
@@ -3279,9 +3345,12 @@ static void completed(void *context) {
   CommitRecord &r=gCommitRing[commandBuffer.commitIndex%32];
   if(r.index==commandBuffer.commitIndex) {
    r.callbackUs=took;
-   {
-    traceStartWriter();traceNote(commandBuffer->createTid);
-    if(commandBuffer->commitTid!=commandBuffer->createTid)traceNote(commandBuffer->commitTid);
+   if(traceWanted()) {
+    traceStartWriter();
+    if(diagOn()) {
+     traceNote(commandBuffer->createTid);
+     if(commandBuffer->commitTid!=commandBuffer->createTid)traceNote(commandBuffer->commitTid);
+    }
     TraceRec rec={};rec.type=1;rec.idx=r.index;rec.t0=commandBuffer->createdUs;rec.t1=r.committedUs;rec.t2=r.scheduledUs>=0?r.committedUs+(uint64_t)r.scheduledUs:0;
     rec.t3=r.committedUs+took;rec.a=r.work.passes;rec.b=r.work.draws;rec.c=(uint32_t)(r.work.pixels>>10);rec.d=r.work.blits;
     rec.tid=commandBuffer->createTid;rec.cpu0=commandBuffer->createCpu;rec.cpu1=commandBuffer->commitCpu;rec.tid2=commandBuffer->commitTid;
@@ -4573,6 +4642,14 @@ extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint
  if(cache && *cache)configureShaderDiskCache(cache);
  gDevice=nmb_device_open(loader,cache);
  if(loader)gLoaderPath=loader;
+ if(gDevice && loader && !strcmp(getprogname(),"backboardd") && (getenv("NATIVE_METAL_TRANSIENT_GMEM") || getenv("NATIVE_METAL_TRANSIENT_SYSMEM_AB"))) {
+  if(void *library=dlopen(loader,RTLD_NOW|RTLD_NOLOAD)) {
+   gSetRenderMode=(void (*)(char))dlsym(library,"tu_sheng_set_thread_render_mode");
+   if(gSetRenderMode)gTransientRenderPolicy=getenv("NATIVE_METAL_TRANSIENT_GMEM")?
+      TransientRenderPolicy::Gmem:TransientRenderPolicy::Compare;
+   dlclose(library);
+  }
+ }
  if(diagOn() && loader) {
   if(gpuTraceOn())if(void *library=dlopen(loader,RTLD_NOW|RTLD_NOLOAD))
    gFrameTransport=(bool (*)(uint32_t,const void *,uint32_t))dlsym(library,"tu_darwin_frame_diagnostic");
