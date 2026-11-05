@@ -239,21 +239,29 @@ static id deviceForPort(unsigned port) {
         // command buffer was no better (17.8 ms mean and 56.1 ms at p95 in tile memory, 17.1 and 52.1 in system memory), and one home screen frame
         // still came out with red and blue exchanged. sheng-tu-debug= overrides this for experiments.
         setenv("TU_DEBUG", bootArgSet("sheng-fb-bgra=1") ? "sysmem,nocb" : "nocb", 0);
-        // Mode 2 keeps frontend frame timing while Turnip and the runtime use their normal unstamped path.
+        // Modes 2 and 4 keep frontend frame timing. Mode 4 also enables Turnip pass stamps.
         // The kernel reads sheng-gpu-trace independently.
-        const bool frameTimingOnly = bootArgSet("sheng-diag=2");
+        const bool passTiming = bootArgSet("sheng-diag=4");
+        const bool frameTimingOnly = bootArgSet("sheng-diag=2") || passTiming;
         const bool gpuTrace = bootArgSet("sheng-gpu-trace=1");
         if (frameTimingOnly) setenv("SHENG_FRAME_TIMING", "1", 1);
         else unsetenv("SHENG_FRAME_TIMING");
         if (!frameTimingOnly && (bootArgSet("sheng-diag=1") || gpuTrace)) setenv("SHENG_DIAG", "1", 1);
         else unsetenv("SHENG_DIAG");
-        if (!frameTimingOnly && gpuTrace) setenv("SHENG_GPU_TRACE", "1", 1);
+        if (passTiming || (!frameTimingOnly && gpuTrace)) setenv("SHENG_GPU_TRACE", "1", 1);
         else unsetenv("SHENG_GPU_TRACE");
         // The measured full-screen transient layout benefits from GMEM on uke.
         if (frameTimingOnly && bootArgSet("sheng-gpu-trace=2"))
             setenv("NATIVE_METAL_TRANSIENT_GMEM", "1", 1);
         else unsetenv("NATIVE_METAL_TRANSIENT_GMEM");
         unsetenv("NATIVE_METAL_TRANSIENT_SYSMEM_AB");
+        // Per-pass diagnostics in mode 2: Turnip stamps a pass's GPU begin/end and traces its GMEM swaps only while SHENG_DIAG or
+        // SHENG_PER_PASS is set. Mode 4 selects it directly from the boot arguments. Mode 2 retains the legacy
+        // /private/var/ngpu/per-pass opt-in. Both keep the rest of SHENG_DIAG off.
+        const bool perPass = passTiming ||
+            (frameTimingOnly && access("/private/var/ngpu/per-pass", F_OK) == 0);
+        if (perPass) setenv("SHENG_PER_PASS", "1", 1);
+        else unsetenv("SHENG_PER_PASS");
         if (bootArgSet("sheng-wallpaper-freeze=1")) setenv("NATIVE_METAL_FREEZE_WALLPAPER", "1", 1);
         // log-gpu=1: the GPU stack's log lines (NSLog, the pipeline journal); off without it.
         if (bootArgSet("log-gpu=1")) setenv("SHENG_LOG_GPU", "1", 1);

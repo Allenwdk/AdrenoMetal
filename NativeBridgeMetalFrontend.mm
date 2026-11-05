@@ -381,12 +381,14 @@ static void traceStartWriter() {
    usleep(250000);
    if(render && fd<0)for(const char *path:paths){fd=open(path,O_WRONLY|O_CREAT|O_TRUNC,0644);if(fd>=0)break;}
    if(render && fd<0)continue;
-   if(diagOn() && !turnip && !gLoaderPath.empty()) {   // the runtime loads Turnip after this thread may have started
+   if((diagOn() || getenv("SHENG_PER_PASS")) && !turnip && !gLoaderPath.empty()) {
     turnip=dlopen(gLoaderPath.c_str(),RTLD_NOW|RTLD_NOLOAD);
     if(turnip) {
      passRead=(uint32_t (*)(uint32_t,PassRec *,uint32_t,uint32_t *))dlsym(turnip,"tu_pass_ring_read");
-     subRead=(uint32_t (*)(uint32_t,SubRec *,uint32_t,uint32_t *))dlsym(turnip,"tu_darwin_submit_ring_read");
-     copyStats=(void (*)(uint64_t *))dlsym(turnip,"tu_copy_row_stats");
+     if(diagOn()) {
+      subRead=(uint32_t (*)(uint32_t,SubRec *,uint32_t,uint32_t *))dlsym(turnip,"tu_darwin_submit_ring_read");
+      copyStats=(void (*)(uint64_t *))dlsym(turnip,"tu_copy_row_stats");
+     }
     }
    }
    if(render && !header) {

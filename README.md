@@ -39,3 +39,7 @@ On release `2026-11-03-ipados27-gpu-coreimage-resources` (kernel CRC `90B6BC7012
 Drains register the queued prefix they need. Batch completion broadcasts only for newly completed targets; later enqueues do not delay earlier drains. Prefix storage retains capacity, same-prefix waiters share a notification, and work notifications occur only on empty-to-nonempty transitions. Batch trace phase4 marks an eligible-prefix notification. FIFO, scheduled/completed callbacks and ownership retain their original conditions. Host checks and formal image assembly pass; uke hardware latency remains pending.
 
 With `sheng-diag=2 sheng-gpu-trace=2`, the current candidate alternates explicit GMEM and SYSMEM requests for large single-sample BGRA IOSurface passes whose extra color attachments are disposable memoryless targets. It records the request alongside command summaries. The scope resets after every encoder operation. SYSMEM allocates backing for those targets. Pixel correctness and performance await hardware comparison.
+
+## Uke pass-timing repair
+
+The non-fetch ROAA experiment was withdrawn after a user reported icon and rendering errors on C352017CCC10D54B. Turnip uses the original ordering code. `sheng-diag=4` enables the lightweight frontend timings plus explicit Turnip pass stamps and GPU pass/attachment events. The frame writer reads the pass ring with SHENG_PER_PASS. Modes1/2 keep their selection rules. Pixel recovery, pass delivery and latency require hardware qualification.
