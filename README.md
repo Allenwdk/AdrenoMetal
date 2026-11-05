@@ -43,3 +43,5 @@ With `sheng-diag=2 sheng-gpu-trace=2`, the current candidate alternates explicit
 ## Uke pass-timing repair
 
 The non-fetch ROAA experiment was withdrawn after a user reported icon and rendering errors on C352017CCC10D54B. Turnip uses the original ordering code. `sheng-diag=4` enables the lightweight frontend timings plus explicit Turnip pass stamps and GPU pass/attachment events. The frame writer reads the pass ring with SHENG_PER_PASS. Modes1/2 keep their selection rules. Pixel recovery, pass delivery and latency require hardware qualification.
+
+In Uke lightweight modes2/4, only backboardd receives SHENG_PER_PASS, because it alone exports the pass ring. Other clients keep the bounded icon device/queue/work transport without unused per-pass RB_DONE_TS writes. Mode1 full diagnostics retain their behavior. Candidate hardware overhead improvement is unqualified.
