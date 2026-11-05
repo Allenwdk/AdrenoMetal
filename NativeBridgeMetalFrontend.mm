@@ -4677,11 +4677,11 @@ extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint
    dlclose(library);
   }
  }
- if(diagOn() && loader) {
-  if(gpuTraceOn())if(void *library=dlopen(loader,RTLD_NOW|RTLD_NOLOAD))
+ if(gpuTraceOn() && loader) {
+  if(void *library=dlopen(loader,RTLD_NOW|RTLD_NOLOAD))
    gFrameTransport=(bool (*)(uint32_t,const void *,uint32_t))dlsym(library,"tu_darwin_frame_diagnostic");
-  nmb_gpu_diagnostic_hook(frameRuntime);
  }
+ if(diagOn() && loader)nmb_gpu_diagnostic_hook(frameRuntime);
  if(!gDevice){NBLOG(@"native-metal: device refused: %s",nmb_last_error());return nil;}
  watchImportPressure();
  if(cache && logGpuOn()){gJournalPath=std::string(cache)+"/pipelines-"+std::to_string(getpid())+".log";gJournalBegan=nowUs();}
