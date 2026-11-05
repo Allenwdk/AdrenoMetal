@@ -272,7 +272,12 @@ static id deviceForPort(unsigned port) {
         else unsetenv("SHENG_PER_PASS");
         if (bootArgSet("sheng-wallpaper-freeze=1")) setenv("NATIVE_METAL_FREEZE_WALLPAPER", "1", 1);
         // log-gpu=1: the GPU stack's log lines (NSLog, the pipeline journal); off without it.
-        if (bootArgSet("log-gpu=1")) setenv("SHENG_LOG_GPU", "1", 1);
+        // uke's boot line sits at its 1000B budget, so backboardd also accepts an owner marker: its
+        // journal is written into the m2v cache directory the diagnostic export already carries.
+        const bool journalPipelines = bootArgSet("log-gpu=1") ||
+            (strcmp(getprogname(), "backboardd") == 0 &&
+             access("/private/var/ngpu/log-gpu", F_OK) == 0);
+        if (journalPipelines) setenv("SHENG_LOG_GPU", "1", 1);
         else unsetenv("SHENG_LOG_GPU");
         if (strcmp(getprogname(), "backboardd") != 0) return device = clientDevice(port);
         // The discovery releases the accelerator port when it is done; the monitor and the scanout client keep using it.
