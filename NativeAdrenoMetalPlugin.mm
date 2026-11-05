@@ -255,6 +255,12 @@ static id deviceForPort(unsigned port) {
             setenv("NATIVE_METAL_TRANSIENT_GMEM", "1", 1);
         else unsetenv("NATIVE_METAL_TRANSIENT_GMEM");
         unsetenv("NATIVE_METAL_TRANSIENT_SYSMEM_AB");
+        // Owner-selected Uke experiment: avoid the measured late-memoryless-write split.
+        const bool deferMemoryless = frameTimingOnly && bootArgSet("sheng-gpu-trace=2") &&
+            strcmp(getprogname(), "backboardd") == 0 &&
+            access("/private/var/ngpu/defer-memoryless", F_OK) == 0;
+        if (deferMemoryless) setenv("NATIVE_METAL_DEFER_MEMORYLESS_PASS", "1", 1);
+        else unsetenv("NATIVE_METAL_DEFER_MEMORYLESS_PASS");
         // Per-pass diagnostics in mode 2: Turnip stamps a pass's GPU begin/end and traces its GMEM swaps only while SHENG_DIAG or
         // SHENG_PER_PASS is set. Mode 4 selects it directly from the boot arguments. Mode 2 retains the legacy
         // /private/var/ngpu/per-pass opt-in. Both keep the rest of SHENG_DIAG off.

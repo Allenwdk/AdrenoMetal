@@ -1,0 +1,43 @@
+--- a/crates/metal2vulkan-runtime/src/render/inline_first.rs
++++ b/crates/metal2vulkan-runtime/src/render/inline_first.rs
+@@ -215,6 +215,40 @@
+     if !plain || layout.colors.iter().flatten().next().is_none() {
+         return Err(NotInline::Layouts);
+     }
++    // A late first write to a transient color splits an inline instance. Uke's
++    // measured full-screen layout takes the existing deferred secondary path so
++    // all writes are known before the render pass is planned. Other layouts and
++    // clients keep their original decision; no attachment or barrier is removed.
++    static DEFER_MEMORYLESS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    let selected = layout.extent == [3200, 2136]
++        && layout.colors.first().and_then(Option::as_ref).is_some_and(|color| {
++            color.target.texture.pixel_format() == metal2vulkan::metal::PixelFormat::BGRA8Unorm
++                && color.target.texture.image_over_buffer()
++                && color.load == LoadAction::Load
++                && color.store == StoreAction::Store
++                && color.resolve.is_none()
++                && color.copied_resolve.is_none()
++                && !color.late_store
++        });
++    let transient = |color: &ColorTarget| {
++        (color.memoryless || super::memoryless(&color.target))
++            && color.load == LoadAction::DontCare
++            && color.store == StoreAction::DontCare
++            && color.resolve.is_none()
++            && color.copied_resolve.is_none()
++            && !color.late_store
++            && color.target.extent[0] == layout.extent[0]
++            && color.target.extent[1] == layout.extent[1]
++    };
++    if selected
++        && layout.colors.iter().skip(1).flatten().any(transient)
++        && layout.colors.iter().skip(1).flatten().all(transient)
++        && *DEFER_MEMORYLESS.get_or_init(|| {
++            std::env::var_os("NATIVE_METAL_DEFER_MEMORYLESS_PASS").is_some()
++        })
++    {
++        return Err(NotInline::MemorylessWrites);
++    }
+     let area = inline_area(layout);
+     for color in layout.colors.iter().flatten() {
+         let target = &color.target;
