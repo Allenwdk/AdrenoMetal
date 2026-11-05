@@ -395,6 +395,8 @@ static void traceStartWriter() {
     header=true;
     struct timeval wall;gettimeofday(&wall,nullptr);
     TraceRec rec={};rec.type=0;rec.t0=nowUs();rec.t1=(uint64_t)wall.tv_sec*1000000ull+(uint64_t)wall.tv_usec;rec.b=(uint32_t)getpid();rec.c=(uint32_t)wall.tv_sec;rec.d=2;tracePush(rec);
+    // Type26 identifies exact-rational pass timestamps; legacy exports used integer 52 ns/tick.
+    TraceRec clock={};clock.type=26;clock.t0=nowUs();clock.a=19200000;clock.b=1;tracePush(clock);
    }
    // Turnip's own rings (render passes, kernel submissions) go into the same file, in the order they are read.
    if(passRead) {
@@ -462,6 +464,24 @@ static void traceStartWriter() {
      TraceRec rec={};rec.type=11;rec.t0=nowUs();rec.t1=now[0]|now[3]<<32;rec.t2=now[1]|now[4]<<32;rec.t3=now[2];
      rec.a=(uint32_t)now[5];rec.b=(uint32_t)now[6];rec.c=(uint32_t)now[7];rec.d=(uint32_t)now[9];rec.tid=(uint32_t)now[8];rec.cpu0=(uint32_t)(now[8]>>32);
      tracePush(rec);
+    }
+   }
+   // Sample existing runtime counts on this writer, without GPU commands or hot-path hooks.
+   if(gDevice && getenv("SHENG_PER_PASS")) {
+    static uint64_t lastPass[10]={},lastTexture[8]={};
+    uint64_t pass[10]={},texture[8]={};
+    const uint64_t sampled=nowUs();
+    auto counts=[&](uint32_t type,const uint64_t *values,unsigned count) {
+     for(unsigned first=0;first<count;first+=3) {
+      TraceRec rec={};rec.type=type;rec.t0=sampled;rec.a=first;
+      memcpy(&rec.t1,values+first,std::min(3u,count-first)*sizeof(uint64_t));tracePush(rec);
+     }
+    };
+    if(nmb_device_pass_counts(gDevice,pass) && memcmp(pass,lastPass,sizeof pass)) {
+     memcpy(lastPass,pass,sizeof pass);counts(24,pass,10);
+    }
+    if(nmb_device_texture_counts(gDevice,texture) && memcmp(texture,lastTexture,sizeof texture)) {
+     memcpy(lastTexture,texture,sizeof texture);counts(25,texture,8);
     }
    }
    uint32_t head=gTraceHead.load();
