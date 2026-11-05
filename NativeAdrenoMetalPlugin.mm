@@ -258,8 +258,10 @@ static id deviceForPort(unsigned port) {
         // Per-pass diagnostics in mode 2: Turnip stamps a pass's GPU begin/end and traces its GMEM swaps only while SHENG_DIAG or
         // SHENG_PER_PASS is set. Mode 4 selects it directly from the boot arguments. Mode 2 retains the legacy
         // /private/var/ngpu/per-pass opt-in. Both keep the rest of SHENG_DIAG off.
-        const bool perPass = passTiming ||
-            (frameTimingOnly && access("/private/var/ngpu/per-pass", F_OK) == 0);
+        // Only backboardd exports Turnip's pass ring. Other clients retain the
+        // bounded device/queue/work records without unused RB_DONE_TS writes.
+        const bool perPass = strcmp(getprogname(), "backboardd") == 0 &&
+            (passTiming || (frameTimingOnly && access("/private/var/ngpu/per-pass", F_OK) == 0));
         if (perPass) setenv("SHENG_PER_PASS", "1", 1);
         else unsetenv("SHENG_PER_PASS");
         if (bootArgSet("sheng-wallpaper-freeze=1")) setenv("NATIVE_METAL_FREEZE_WALLPAPER", "1", 1);
