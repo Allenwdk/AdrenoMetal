@@ -10,7 +10,7 @@ Build and interface details: [documentation](https://unixnu.com/drivers/adreno-m
 
 ## Memory reuse
 
-Unused owned image backing can serve later pooled or dedicated images. Extra image spares share a 256 MiB device budget and expire after ten seconds. Plain unused backing of at least 256 KiB can be released by the existing room worker, with at most 128 MiB queued. Allocation failure reclaims queued backing before retrying. Imported memory and owner callbacks retain their release ordering.
+Unused owned image backing is reused by pooled and dedicated images. Extra spares have no byte limit, expire after ten seconds, and go sooner under memory pressure or when a new block cannot be made. Blocks are freed off the releasing thread on the runtime's free thread, and on the releasing thread once its queue is full. An allocation failure releases kept spares and waits for posted frees before retrying. Imported memory and owner callbacks keep their release ordering.
 
 ## Frame diagnostics
 
@@ -19,6 +19,8 @@ With `sheng-gpu-trace=1`, the render server writes command phases, encoding batc
 `sheng-diag=2` records backboardd command summaries, commit-to-encode timing and scanout-client events in the frame trace. Turnip and the runtime use their ordinary path without per-pass stamps or detailed diagnostics. Kernel tracing is configured separately.
 
 `sheng-wallpaper-freeze=1` enables wallpaper isolation. A Poster renderer freezes GPU submission after a successful command draws into and stores an IOSurface of at least two million pixels. The completed output stays retained. Later commands remain committed and unscheduled, with their resources and queue leases retained. Already submitted work completes normally. PosterBoard and other processes keep submitting. The switch defaults to off; `NATIVE_METAL_FREEZE_WALLPAPER=1` selects the same mode directly in a renderer process.
+
+`sheng-metal-flow=1` enables the runtime's lowering thread, commit submission and pipeline warm pass for testing. The switch defaults to off. Either value of `sheng-metal-flow=` logs the `FL` counts to os_log when they change.
 
 Slow encoding operations retain source lines and enqueue times. Completion handlers and resource destructors carry individual timing and identities. Kernel sampling of the render, encode and completion threads and blocked-thread waits provide the cross-thread wait record.
 

@@ -11,6 +11,7 @@
 #import <IOSurface/IOSurfaceRef.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
+#include <os/log.h>
 #include <algorithm>
 #include <array>
 #include <memory>
@@ -4682,6 +4683,25 @@ static void installAnswers(Class cls) {
  }
 }
 
+// With sheng-metal-flow= set (NATIVE_METAL_FLOW), the warm pass and work placement counts go to os_log every ten seconds when they changed.
+static void logFlowCounts() {
+ const char *setting=getenv("NATIVE_METAL_FLOW");
+ if(!setting)return;
+ const int on=strcmp(setting,"0")!=0;
+ static dispatch_source_t timer;
+ timer=dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER,0,0,dispatch_get_global_queue(QOS_CLASS_UTILITY,0));
+ dispatch_source_set_timer(timer,dispatch_time(DISPATCH_TIME_NOW,10*NSEC_PER_SEC),10*NSEC_PER_SEC,2*NSEC_PER_SEC);
+ dispatch_source_set_event_handler(timer,^{
+  static uint64_t last[8];
+  uint64_t c[8]={};
+  if(!nmb_device_flow_counts(gDevice,c) || !memcmp(c,last,sizeof c))return;
+  memcpy(last,c,sizeof c);
+  os_log(OS_LOG_DEFAULT,"FL flow=%d w %llu/%llu/%llu %lluK cm %llu/%llu lw %llu le %llu",on,(unsigned long long)c[0],(unsigned long long)c[1],
+   (unsigned long long)c[2],(unsigned long long)(c[3]>>10),(unsigned long long)c[4],(unsigned long long)c[5],(unsigned long long)c[6],(unsigned long long)c[7]);
+ });
+ dispatch_resume(timer);
+}
+
 extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint64_t registryID,void (*missing)(const char *,const char *)) {
  installCoreImageResourceFallback();
  if(gDeviceObject)return gDeviceObject;
@@ -4704,6 +4724,7 @@ extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint
  if(diagOn() && loader)nmb_gpu_diagnostic_hook(frameRuntime);
  if(!gDevice){NBLOG(@"native-metal: device refused: %s",nmb_last_error());return nil;}
  watchImportPressure();
+ logFlowCounts();
  if(cache && logGpuOn()){gJournalPath=std::string(cache)+"/pipelines-"+std::to_string(getpid())+".log";gJournalBegan=nowUs();}
  char name[128]={};nmb_device_name(gDevice,name,sizeof name);gName=[NSString stringWithUTF8String:name];gRegistryID=registryID;
  // The target families supportsFamily: answers true, with the rows of Apple's tables the device does not meet in them (nmb_device_family_waivers).
@@ -4931,6 +4952,12 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
   if(nmb_device_texture_counts(gDevice,tc))
    row("L inp %llu/%llu rf %llu/%llu sh %llu cp %llu bk %llu rt %llu",(unsigned long long)tc[0],(unsigned long long)tc[1],(unsigned long long)tc[2],
     (unsigned long long)tc[3],(unsigned long long)tc[4],(unsigned long long)tc[5],(unsigned long long)tc[6],(unsigned long long)tc[7]);
+  // The warm pass (records warmed, failed, unread, KiB of driver data) and where work ran: scheduler passes and batches at commit, render
+  // log waits, encoder ends on the lowering thread.
+  uint64_t flow[8]={};
+  if(nmb_device_flow_counts(gDevice,flow))
+   row("FL w %llu/%llu/%llu %lluK cm %llu/%llu lw %llu le %llu",(unsigned long long)flow[0],(unsigned long long)flow[1],(unsigned long long)flow[2],
+    (unsigned long long)(flow[3]>>10),(unsigned long long)flow[4],(unsigned long long)flow[5],(unsigned long long)flow[6],(unsigned long long)flow[7]);
   // Textures over host pages at rows or offsets this GPU's linear images cannot take: how many, MiB, the largest and who made it.
   {
    std::lock_guard<std::mutex> lock(gUnalignedLock);

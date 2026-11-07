@@ -270,6 +270,11 @@ static id deviceForPort(unsigned port) {
             (passTiming || (frameTimingOnly && access("/private/var/ngpu/per-pass", F_OK) == 0));
         if (perPass) setenv("SHENG_PER_PASS", "1", 1);
         else unsetenv("SHENG_PER_PASS");
+        // sheng-metal-flow=1 enables the lowering thread, commit submission and the warm pass; =0 states the default. Either logs the FL counts
+        // (native_bridge_metal_open), so two runs compare without sheng-diag=1's own cost.
+        if (bootArgSet("sheng-metal-flow=0")) setenv("NATIVE_METAL_FLOW", "0", 1);
+        else if (bootArgSet("sheng-metal-flow=1")) setenv("NATIVE_METAL_FLOW", "1", 1);
+        else unsetenv("NATIVE_METAL_FLOW");
         if (bootArgSet("sheng-wallpaper-freeze=1")) setenv("NATIVE_METAL_FREEZE_WALLPAPER", "1", 1);
         // log-gpu=1: the GPU stack's log lines (NSLog, the pipeline journal); off without it.
         // uke's boot line sits at its 1000B budget, so backboardd also accepts an owner marker: its
