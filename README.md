@@ -94,3 +94,5 @@ In Uke lightweight modes2/4, only backboardd receives SHENG_PER_PASS, because it
 Lightweight per-pass exports identify the exact19.2MHz timestamp conversion with type26. The existing writer snapshots runtime pass-split and host-texture copy counts as types24/25 only when they change. These are cumulative diagnostic counters; no additional GPU work or rendering-order change. Legacy integer52ns pass times need625/624 before cross-stream joins, while exact-tagged times do not.
 
 Uke keeps legacy `sheng-*` kernel argument spellings compatible with the upstream names. Lightweight modes2/4 retain per-pass timing, original-nil Core Image resource loading and the selected deferred memoryless policy. The upstream cache, purgeable-resource and YCbCr implementations are shared with the iOS27 build. Hardware regression is pending.
+
+With diag=1, runtime error messages and device-recovered notices are forwarded to os_log before device creation. Each category retains at most 32 messages per process. This preserves the first Vulkan failure when stderr is unavailable and later warnings replace the telemetry warning row.

@@ -5114,11 +5114,19 @@ extern "C" bool native_bridge_metal_system_cache(const char *reader,const uint32
  gSystemCacheState=3;gSystemCacheText=nmb_last_error();
  return false;
 }
+static void runtimeMessage(uint32_t recovered,const char *message) {
+ static std::atomic<unsigned> errors{0},recoveries{0};
+ auto &count=recovered?recoveries:errors;
+ if(count.fetch_add(1,std::memory_order_relaxed)<32)
+  os_log_error(OS_LOG_DEFAULT,"NativeAdrenoMetal runtime: %{public}s",message);
+}
+
 extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint64_t registryID,void (*missing)(const char *,const char *)) {
  installCoreImageResourceFallback();
  if(gDeviceObject)return gDeviceObject;
  gMissing=missing;gInFlight=[NSMutableSet set];
  if(cache && *cache){configureShaderDiskCache(cache);gCacheRoot=cache;}
+ if(diagOn())nmb_message_hook(runtimeMessage);
  gDevice=nmb_device_open(loader,cache);
  if(loader)gLoaderPath=loader;
  if(gDevice && loader && !strcmp(getprogname(),"backboardd") && (getenv("NATIVE_METAL_TRANSIENT_GMEM") || getenv("NATIVE_METAL_TRANSIENT_SYSMEM_AB"))) {

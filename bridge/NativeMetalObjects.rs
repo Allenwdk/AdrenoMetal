@@ -351,8 +351,27 @@ fn log_message(message: &DebugMessage) {
     eprintln!("native-metal message {} {:?}: [{}] {}", seen.len(), message.severity, message.id_name, message.text);
 }
 
+static MESSAGE_HOOK: std::sync::Mutex<Option<extern "C" fn(u32, *const c_char)>> = std::sync::Mutex::new(None);
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_message_hook(hook: extern "C" fn(u32, *const c_char)) {
+    if let Ok(mut current) = MESSAGE_HOOK.lock() {
+        *current = Some(hook);
+    }
+}
+
 fn observe_message(message: &DebugMessage) {
     use std::sync::atomic::Ordering::Relaxed;
+    let recovered = message.id_name == "device-recovered";
+    if recovered || message.severity >= MessageSeverity::Error {
+        let hook = MESSAGE_HOOK.lock().ok().and_then(|hook| *hook);
+        if let Some(hook) = hook {
+            let text = format!("[{}] {}", message.id_name, message.text).replace('\0', " ");
+            if let Ok(text) = std::ffi::CString::new(text) {
+                hook(u32::from(recovered), text.as_ptr());
+            }
+        }
+    }
     if message.id_name == "shadowed-texture" {
         note_shadow(&message.text);
     }
