@@ -410,6 +410,7 @@ bool nmb_blit_generate_mipmaps(NmbEncoder *, NmbTexture *);
 uint64_t nmb_command_buffer_diagnostic_id(const NmbCommandBuffer *buffer);
 void nmb_gpu_diagnostic_hook(void (*hook)(uint32_t,uint64_t,uint64_t,uint64_t));
 void nmb_message_hook(void (*hook)(uint32_t,const char *));
+bool nmb_command_buffer_lost_generation(const NmbCommandBuffer *);
 #ifdef __cplusplus
 }
 #endif

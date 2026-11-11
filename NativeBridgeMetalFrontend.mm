@@ -3490,8 +3490,8 @@ static char kUserDictionaryKey;
    }
   watched.clear();[_sampled removeAllObjects];
  }
- // The runtime reports Vulkan's DeviceLost as Metal's code 11 (see -error).
- const bool lost=!self.failedLocally && nmb_command_buffer_metal_error_code(_handle)==11;
+ // A runtime recovery also invalidates retained resources. Its hang and victim keep Metal codes 2 and 1.
+ const bool lost=!self.failedLocally && nmb_command_buffer_lost_generation(_handle);
  void (^run)(void)=^{
   frontStage(self->traceNumber,self.commitIndex,12);
   DetailCommandScope commandScope(self->traceNumber);

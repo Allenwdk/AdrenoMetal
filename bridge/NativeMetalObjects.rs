@@ -2656,6 +2656,15 @@ fn metal_command_buffer_error_code(error: Option<CommandBufferError>) -> u64 {
     error.filter(|error| error.origin() == FailureOrigin::Metal).map_or(0, |error| error.metal_code())
 }
 
+fn command_buffer_lost_generation(error: Option<CommandBufferError>) -> bool {
+    matches!(error, Some(CommandBufferError::DeviceLost | CommandBufferError::GpuHang | CommandBufferError::GpuRecoveryVictim))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_command_buffer_lost_generation(command_buffer: *const NmbCommandBuffer) -> bool {
+    guard(false, || Ok(command_buffer_lost_generation(get(command_buffer)?.0.error())))
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn nmb_command_buffer_metal_error_code(command_buffer: *const NmbCommandBuffer) -> u64 {
     guard(0, || Ok(metal_command_buffer_error_code(get(command_buffer)?.0.error())))
@@ -2672,6 +2681,19 @@ mod command_buffer_error_tests {
         assert_eq!(metal_command_buffer_error_code(Some(CommandBufferError::OutOfMemory)), 8);
         assert_eq!(metal_command_buffer_error_code(Some(CommandBufferError::Refused)), 0);
         assert_eq!(metal_command_buffer_error_code(None), 0);
+    }
+
+    #[test]
+    fn device_loss_and_recovery_errors_identify_the_lost_generation() {
+        for error in [CommandBufferError::DeviceLost, CommandBufferError::GpuHang, CommandBufferError::GpuRecoveryVictim] {
+            assert!(command_buffer_lost_generation(Some(error)));
+        }
+        for error in [CommandBufferError::PageFault, CommandBufferError::OutOfMemory, CommandBufferError::Refused] {
+            assert!(!command_buffer_lost_generation(Some(error)));
+        }
+        assert!(!command_buffer_lost_generation(None));
+        assert_eq!(metal_command_buffer_error_code(Some(CommandBufferError::GpuHang)), 2);
+        assert_eq!(metal_command_buffer_error_code(Some(CommandBufferError::GpuRecoveryVictim)), 1);
     }
 }
 

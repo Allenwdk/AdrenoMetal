@@ -96,3 +96,5 @@ Lightweight per-pass exports identify the exact19.2MHz timestamp conversion with
 Uke keeps legacy `sheng-*` kernel argument spellings compatible with the upstream names. Lightweight modes2/4 retain per-pass timing, original-nil Core Image resource loading and the selected deferred memoryless policy. The upstream cache, purgeable-resource and YCbCr implementations are shared with the iOS27 build. Hardware regression is pending.
 
 With diag=1, runtime error messages and device-recovered notices are forwarded to os_log before device creation. Each category retains at most 32 messages per process. This preserves the first Vulkan failure when stderr is unavailable and later warnings replace the telemetry warning row.
+
+The render server uses its existing post-completion restart path after DeviceLost, GpuHang or GpuRecoveryVictim. The runtime replaces its Vulkan device after a loss and refuses retained resources from the previous generation. Metal error codes keep their existing values, and other client processes receive their completion errors.
