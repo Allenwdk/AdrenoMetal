@@ -351,41 +351,14 @@ static id deviceForPort(unsigned port) {
         // Concurrent binning is a Turnip option that is off unless asked for (tu_allow_concurrent_binning, read from the environment
         // by Mesa's option parser): with it the BV thread bins a pass while BR still renders the one before. nocb in tu-debug= turns it off.
         setenv("tu_allow_concurrent_binning", "true", 0);
-#if TARGET_OS_IOS
-        // Keep the measured Uke binning and BGRA workarounds by default. tu-debug= can override them.
-        setenv("TU_DEBUG", bootArgSet("fb-bgra=1") ? "sysmem,nocb" : "nocb", 0);
-#endif
-        // Modes 2 and 4 keep frontend frame timing. Mode 4 also enables Turnip pass stamps.
-        // The kernel reads sheng-gpu-trace independently.
-        const bool passTiming = bootArgSet("diag=4");
-        const bool frameTimingOnly = bootArgSet("diag=2") || passTiming;
-        const bool gpuTrace = bootArgSet("gpu-trace=1");
-        if (frameTimingOnly) setenv("SHENG_FRAME_TIMING", "1", 1);
-        else unsetenv("SHENG_FRAME_TIMING");
-        if (!frameTimingOnly && (bootArgSet("diag=1") || gpuTrace)) setenv("SHENG_DIAG", "1", 1);
+        // diag=1 turns on every diagnostic of the GPU stack in this process: the frontend's frame trace, Turnip's pass stamps and
+        // submission ring, the runtime's stage ring, and in the render server the status and telemetry lines. Without it none of them runs.
+        if (bootArgSet("diag=1") || bootArgSet("gpu-trace=1")) setenv("SHENG_DIAG", "1", 1);
         else unsetenv("SHENG_DIAG");
-        if (passTiming || (!frameTimingOnly && gpuTrace)) setenv("SHENG_GPU_TRACE", "1", 1);
+        if (bootArgSet("gpu-trace=1")) setenv("SHENG_GPU_TRACE", "1", 1);
         else unsetenv("SHENG_GPU_TRACE");
-        // The measured full-screen transient layout benefits from GMEM on uke.
-        if (frameTimingOnly && bootArgSet("gpu-trace=2"))
-            setenv("NATIVE_METAL_TRANSIENT_GMEM", "1", 1);
-        else unsetenv("NATIVE_METAL_TRANSIENT_GMEM");
-        unsetenv("NATIVE_METAL_TRANSIENT_SYSMEM_AB");
-        // Owner-selected Uke experiment: avoid the measured late-memoryless-write split.
-        const bool deferMemoryless = frameTimingOnly && bootArgSet("gpu-trace=2") &&
-            strcmp(getprogname(), "backboardd") == 0 &&
-            access("/private/var/ngpu/defer-memoryless", F_OK) == 0;
-        if (deferMemoryless) setenv("NATIVE_METAL_DEFER_MEMORYLESS_PASS", "1", 1);
-        else unsetenv("NATIVE_METAL_DEFER_MEMORYLESS_PASS");
-        // Per-pass diagnostics in mode 2: Turnip stamps a pass's GPU begin/end and traces its GMEM swaps only while SHENG_DIAG or
-        // SHENG_PER_PASS is set. Mode 4 selects it directly from the boot arguments. Mode 2 retains the legacy
-        // /private/var/ngpu/per-pass opt-in. Both keep the rest of SHENG_DIAG off.
-        // Only backboardd exports Turnip's pass ring. Other clients retain the
-        // bounded device/queue/work records without unused RB_DONE_TS writes.
-        const bool perPass = strcmp(getprogname(), "backboardd") == 0 &&
-            (passTiming || (frameTimingOnly && access("/private/var/ngpu/per-pass", F_OK) == 0));
-        if (perPass) setenv("SHENG_PER_PASS", "1", 1);
-        else unsetenv("SHENG_PER_PASS");
+        // The bridge's work placement (metal-flow=<bits>, read below). Any value logs the FL counts
+        // (native_bridge_metal_open), so two runs compare without diag=1's own cost.
         // gpu-purge=0: the bridge discards nothing of what callers declare Volatile (NativeMetalPurge.rs), for a comparison on the
         // same image. Read by the bridge as the device opens.
         if (bootArgSet("gpu-purge=0")) setenv("NATIVE_METAL_PURGE", "0", 1);
@@ -408,12 +381,7 @@ static id deviceForPort(unsigned port) {
         }
         if (bootArgSet("wallpaper-freeze=1")) setenv("NATIVE_METAL_FREEZE_WALLPAPER", "1", 1);
         // log-gpu=1: the GPU stack's log lines (NSLog, the pipeline journal); off without it.
-        // uke's boot line sits at its 1000B budget, so backboardd also accepts an owner marker: its
-        // journal is written into the m2v cache directory the diagnostic export already carries.
-        const bool journalPipelines = bootArgSet("log-gpu=1") ||
-            (strcmp(getprogname(), "backboardd") == 0 &&
-             access("/private/var/ngpu/log-gpu", F_OK) == 0);
-        if (journalPipelines) setenv("SHENG_LOG_GPU", "1", 1);
+        if (bootArgSet("log-gpu=1")) setenv("SHENG_LOG_GPU", "1", 1);
         else unsetenv("SHENG_LOG_GPU");
 #if TARGET_OS_OSX
         // macOS: Turnip opens the accelerator by class (AGXAccelerator here); the display takes plain rows (no Apple framebuffer or IOSurface
