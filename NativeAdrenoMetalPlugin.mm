@@ -342,11 +342,19 @@ static id deviceForPort(unsigned port) {
                     setenv("TU_DEBUG", value, 1);
                 }
         }
-        // Every pass renders in system memory with the 8-bit BGRA framebuffer (fb-bgra=1): measured against tile memory with the swap of
-        // GMEM loads and stores fixed (patches/mesa/turnip-gmem-mutable-swap.patch, lock screen 99.5 % equal to the RGhA picture), the GPU time per
-        // command buffer was no better (17.8 ms mean and 56.1 ms at p95 in tile memory, 17.1 and 52.1 in system memory), and one home screen frame
-        // still came out with red and blue exchanged. sheng-tu-debug= overrides this for experiments.
+        // Turnip chooses each pass's rendering: tile memory (GMEM) or system memory, by its own rules (a pass with a memoryless
+        // attachment or a feedback loop in tile memory, a pass of few draws in system memory, the others by the bandwidth each would
+        // take), with concurrent binning. A pass in system memory has no tile load and store, which is what a screen-size pass that
+        // draws on a small part of its target otherwise pays for whole. The colour order of GMEM loads and stores is the image's own
+        // swap on the memory side (patches/mesa/turnip-gmem-memory-side-swap.patch). The RM row of the memory log counts both kinds;
+        // tu-debug= (for instance gmem,nocb: every pass in tile memory, no concurrent binning) overrides this.
+        // Concurrent binning is a Turnip option that is off unless asked for (tu_allow_concurrent_binning, read from the environment
+        // by Mesa's option parser): with it the BV thread bins a pass while BR still renders the one before. nocb in tu-debug= turns it off.
+        setenv("tu_allow_concurrent_binning", "true", 0);
+#if TARGET_OS_IOS
+        // Keep the measured Uke binning and BGRA workarounds by default. tu-debug= can override them.
         setenv("TU_DEBUG", bootArgSet("fb-bgra=1") ? "sysmem,nocb" : "nocb", 0);
+#endif
         // Modes 2 and 4 keep frontend frame timing. Mode 4 also enables Turnip pass stamps.
         // The kernel reads sheng-gpu-trace independently.
         const bool passTiming = bootArgSet("diag=4");
@@ -386,11 +394,18 @@ static id deviceForPort(unsigned port) {
         // for a comparison on the same image. Read by the bridge at the first such texture.
         if (bootArgSet("gpu-ycbcr-planes=0")) setenv("NATIVE_METAL_YCBCR_PLANES", "0", 1);
         else unsetenv("NATIVE_METAL_YCBCR_PLANES");
-        // sheng-metal-flow=1 enables the lowering thread, commit submission and the warm pass; =0 states the default. Either logs the FL counts
-        // (native_bridge_metal_open), so two runs compare without sheng-diag=1's own cost.
-        if (bootArgSet("metal-flow=0")) setenv("NATIVE_METAL_FLOW", "0", 1);
-        else if (bootArgSet("metal-flow=1")) setenv("NATIVE_METAL_FLOW", "1", 1);
-        else unsetenv("NATIVE_METAL_FLOW");
+        {
+            // metal-flow=<bits>: 1 the lowering thread, 2 commit submission, 4 the warm pass; all three without the argument.
+            char args[1100] = {}, flow[16] = "";
+            size_t size = sizeof args - 1;
+            if (sysctlbyname("kern.bootargs", args, &size, nullptr, 0) == 0)
+                if (const char *at = bootArgToken(args, "metal-flow=")) {
+                    strlcpy(flow, at + strlen("metal-flow="), sizeof flow);
+                    flow[strcspn(flow, " ")] = 0;
+                }
+            if (flow[0]) setenv("NATIVE_METAL_FLOW", flow, 1);
+            else unsetenv("NATIVE_METAL_FLOW");
+        }
         if (bootArgSet("wallpaper-freeze=1")) setenv("NATIVE_METAL_FREEZE_WALLPAPER", "1", 1);
         // log-gpu=1: the GPU stack's log lines (NSLog, the pipeline journal); off without it.
         // uke's boot line sits at its 1000B budget, so backboardd also accepts an owner marker: its

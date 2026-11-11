@@ -36,6 +36,15 @@ thread_local! {
 }
 
 pub(crate) fn set_error(why: String) {
+    // A refusal on a lost device names the place in the runtime that first recorded the loss.
+    let why = match metal2vulkan_runtime::Device::lost_at() {
+        // The place within the runtime's sources, not the build tree's path before them.
+        Some((file, line)) if why.contains("DeviceLost") => {
+            let file = file.rfind("/src/").map_or(file, |at| &file[at + 5..]);
+            format!("{why} (lost at {file}:{line})")
+        }
+        _ => why,
+    };
     LAST.with(|last| {
         let mut last = last.borrow_mut();
         last.clear();
@@ -230,10 +239,14 @@ impl PipelineRecords {
     }
 }
 
-/// True where `NATIVE_METAL_FLOW=1` (the boot argument `metal-flow=1`) enables the lowering thread, commit submission and the warm pass.
-fn flow_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("NATIVE_METAL_FLOW").is_some_and(|value| value == "1"))
+/// The work placement the bridge asks of the runtime, as bits: 1 render encoder calls lowered on the device's lowering thread,
+/// 2 a command buffer submitted at its commit (`commit_and_submit`), 4 the warm pass over the pipeline records of earlier
+/// processes. All three by default; `NATIVE_METAL_FLOW=<number>` (the boot argument `metal-flow=<number>`) states the bits, 0 none.
+fn flow_bits() -> u32 {
+    static BITS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *BITS.get_or_init(|| {
+        std::env::var("NATIVE_METAL_FLOW").ok().and_then(|value| value.trim().parse::<u32>().ok()).unwrap_or(7)
+    })
 }
 
 /// # Safety
@@ -259,11 +272,12 @@ pub unsafe extern "C" fn nmb_device_open(loader: *const c_char, cache: *const c_
         // render server showed as missing pieces of the screen while it compiled (int 590aaee2).
         options.policy.pipeline_waits = metal2vulkan::device::PipelineWaitPolicy::Exact;
         // Render encoder calls are checked at the call and lowered on the device's lowering thread, so the program's thread does not
-        // pay for them. A refusal only the lowering finds fails the command buffer, naming the call.
-        if flow_on() {
+        // pay for them (the render server's main thread spent most of the plugin's CPU time lowering). A refusal only the lowering
+        // finds fails the command buffer, naming the call. `metal-flow=` without bit 1 keeps the lowering at the call.
+        if flow_bits() & 1 != 0 {
             options.policy.render_lowering = metal2vulkan::device::RenderLoweringPolicy::Worker;
         }
-        let records = flow_on().then(|| PipelineRecords::open(cache.to_string_lossy().as_ref())).flatten();
+        let records = (flow_bits() & 4 != 0).then(|| PipelineRecords::open(cache.to_string_lossy().as_ref())).flatten();
         if let Some(records) = records.clone() {
             options.pipeline_records = Some(std::sync::Arc::new(move |record| records.keep(&record)));
         }
@@ -968,7 +982,7 @@ fn device_answer(device: &NmbDevice, selector: &str, arg: u64) -> Result<u64, St
         }
         "supportsYCBCRFormats12" => format_supported(PixelFormat::YCBCR124202P) as u64,
         "supportsYCBCRPackedFormats12" => format_supported(PixelFormat::YCBCR124202PPACKED) as u64,
-        "minimumLinearTextureAlignmentForPixelFormat:" => p
+        "minimumLinearTextureAlignmentForPixelFormat:" => d
             .minimum_linear_texture_alignment_for_pixel_format(raw::<PixelFormat>(arg, "pixel format")?)
             .map_err(e("minimum linear texture alignment"))?,
         "supportsTextureSampleCount:" => gap(p.supports_texture_sample_count(arg))?,
@@ -1008,7 +1022,6 @@ pub extern "C" fn nmb_device_linear_bytes_per_row(device: *const NmbDevice, form
     guard(0, || {
         let d = &get(device)?.0;
         let alignment = d
-            .properties()
             .minimum_linear_texture_alignment_for_pixel_format(raw::<PixelFormat>(format, "pixel format")?)
             .map_err(e("linear texture"))?;
         let info = d.pixel_format_info(format);
@@ -2581,7 +2594,7 @@ pub extern "C" fn nmb_command_buffer_commit(command_buffer: *mut NmbCommandBuffe
     guard(false, || {
         // The committing thread submits where no other pass is under way, with no wake of the scheduler thread between commit and GPU.
         let command_buffer = &get(command_buffer)?.0;
-        if flow_on() {
+        if flow_bits() & 2 != 0 {
             command_buffer.commit_and_submit().map_err(e("commit"))?;
         } else {
             command_buffer.commit().map_err(e("commit"))?;
