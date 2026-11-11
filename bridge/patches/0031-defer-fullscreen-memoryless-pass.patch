@@ -1,7 +1,7 @@
 --- a/crates/metal2vulkan-runtime/src/render/inline_first.rs
 +++ b/crates/metal2vulkan-runtime/src/render/inline_first.rs
-@@ -215,6 +215,40 @@
-     if !plain || layout.colors.iter().flatten().next().is_none() {
+@@ -234,6 +234,40 @@
+     if !plain || !attached {
          return Err(NotInline::Layouts);
      }
 +    // A late first write to a transient color splits an inline instance. Uke's
