@@ -39,12 +39,22 @@ pub(crate) fn set_error(why: String) {
     // A refusal on a lost device names the place in the runtime that first recorded the loss.
     let why = match metal2vulkan_runtime::Device::lost_at() {
         // The place within the runtime's sources, not the build tree's path before them.
-        Some((file, line)) if why.contains("DeviceLost") => {
+        Some((file, line)) if why.contains("DeviceLost") || why.contains("MadeBeforeRecovery") => {
             let file = file.rfind("/src/").map_or(file, |at| &file[at + 5..]);
             format!("{why} (lost at {file}:{line})")
         }
         _ => why,
     };
+    // The kernel marker keeps only a short problem summary. Preserve the full
+    // first-loss location for recovered objects through the diagnostic sink too.
+    if why.contains("DeviceLost") || why.contains("MadeBeforeRecovery") {
+        let hook = MESSAGE_HOOK.lock().ok().and_then(|hook| *hook);
+        if let Some(hook) = hook {
+            if let Ok(text) = std::ffi::CString::new(why.as_str()) {
+                hook(0, text.as_ptr());
+            }
+        }
+    }
     LAST.with(|last| {
         let mut last = last.borrow_mut();
         last.clear();
@@ -360,13 +370,22 @@ pub extern "C" fn nmb_message_hook(hook: extern "C" fn(u32, *const c_char)) {
     }
 }
 
+fn persisted_message_kind(id: &str, severity: MessageSeverity) -> Option<bool> {
+    let recovered = id == metal2vulkan_runtime::Degradation::DeviceRecovered.code();
+    (recovered || severity >= MessageSeverity::Error).then_some(recovered)
+}
+
 fn observe_message(message: &DebugMessage) {
     use std::sync::atomic::Ordering::Relaxed;
-    let recovered = message.id_name == "device-recovered";
-    if recovered || message.severity >= MessageSeverity::Error {
+    if let Some(recovered) = persisted_message_kind(&message.id_name, message.severity) {
         let hook = MESSAGE_HOOK.lock().ok().and_then(|hook| *hook);
         if let Some(hook) = hook {
-            let text = format!("[{}] {}", message.id_name, message.text).replace('\0', " ");
+            let origin = if recovered {
+                metal2vulkan_runtime::Device::lost_at().map(|(file, line)| format!("first loss at {file}:{line}; ")).unwrap_or_default()
+            } else {
+                String::new()
+            };
+            let text = format!("[{}] {origin}{}", message.id_name, message.text).replace('\0', " ");
             if let Ok(text) = std::ffi::CString::new(text) {
                 hook(u32::from(recovered), text.as_ptr());
             }
@@ -2673,6 +2692,14 @@ pub extern "C" fn nmb_command_buffer_metal_error_code(command_buffer: *const Nmb
 #[cfg(test)]
 mod command_buffer_error_tests {
     use super::*;
+
+    #[test]
+    fn recovery_notice_reaches_the_consumers_hook() {
+        let id = metal2vulkan_runtime::Degradation::DeviceRecovered.code();
+        assert_eq!(persisted_message_kind(id, MessageSeverity::Warning), Some(true));
+        assert_eq!(persisted_message_kind("other-warning", MessageSeverity::Warning), None);
+        assert_eq!(persisted_message_kind("driver-error", MessageSeverity::Error), Some(false));
+    }
 
     #[test]
     fn metal_errors_keep_their_codes_and_runtime_refusals_keep_their_domain() {
