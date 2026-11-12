@@ -1,0 +1,83 @@
+--- a/crates/metal2vulkan-runtime/src/replay.rs
++++ b/crates/metal2vulkan-runtime/src/replay.rs
+@@ -300,8 +300,8 @@
+     }
+ 
+     /// The render pipeline state `held` holds ([`CallLog::hold_render_state`]).
+-    pub(crate) fn render_state(&self, held: Held) -> &RenderPipelineState {
+-        self.held_render_states.get(held)
++    pub(crate) fn render_state(&self, held: Held) -> Option<&RenderPipelineState> {
++        self.held_render_states.held.get(held.0 as usize)
+     }
+ 
+     /// The depth and stencil state `held` holds ([`CallLog::hold_depth_stencil`]).
+--- a/crates/metal2vulkan-runtime/src/render/call_checks.rs
++++ b/crates/metal2vulkan-runtime/src/render/call_checks.rs
+@@ -158,7 +158,12 @@
+             return NOW;
+         }
+         match call {
+-            C::PipelineState(held) => self.pipeline_state(device, log.render_state(*held)),
++            C::PipelineState(held) => self.pipeline_state(
++                device,
++                log.render_state(*held).ok_or_else(|| {
++                    crate::error::internal("a checked render pipeline state past its log")
++                })?,
++            ),
+             C::Buffer(table, buffer, offset, index) => {
+                 let buffer = buffer.map(|held| log.buffer(held));
+                 let call = staged(table, "buffer");
+--- a/crates/metal2vulkan-runtime/src/render/replay.rs
++++ b/crates/metal2vulkan-runtime/src/render/replay.rs
+@@ -737,7 +737,11 @@
+     use RenderCall as C;
+     use Table as T;
+     match call {
+-        C::PipelineState(state) => encoder.set_render_pipeline_state(log.render_state(*state)),
++        C::PipelineState(state) => encoder.set_render_pipeline_state(
++            log.render_state(*state).ok_or_else(|| {
++                crate::error::internal("a replayed render pipeline state past its log")
++            })?,
++        ),
+         C::Buffer(table, buffer, offset, index) => {
+             let buffer = buffer.map(|held| log.buffer(held));
+             match table {
+--- a/crates/metal2vulkan-runtime/src/render/deferral.rs
++++ b/crates/metal2vulkan-runtime/src/render/deferral.rs
+@@ -860,6 +860,7 @@
+                 return Err(error);
+             }
+         };
++        let at = self.next;
+         self.next += 1;
+         match checked {
+             Checked::Logged => {
+@@ -890,10 +891,24 @@
+                     Lowerer { refused: true, .. } => Ok(()),
+                     Lowerer {
+                         lowering: Some(lowering),
+-                        ..
+-                    } => lowering.logged(|lowering| {
+-                        render(lowering, (&filling.calls, &filling.indexed), &call)
+-                    }),
++                        refused,
++                    } => {
++                        if let RenderCall::PipelineState(held) = &call {
++                            let Some(pipeline) = filling.calls.render_state(*held) else {
++                                let detail = "a synchronous render pipeline state past its log";
++                                lowering.refuse_call(
++                                    EncoderCall::new(call.selector(), at),
++                                    internal(detail),
++                                );
++                                *refused = true;
++                                return Err(internal(detail));
++                            };
++                            return lowering.logged(|lowering| lowering.set_render_pipeline_state(pipeline));
++                        }
++                        lowering.logged(|lowering| {
++                            render(lowering, (&filling.calls, &filling.indexed), &call)
++                        })
++                    }
+                     Lowerer { lowering: None, .. } => Err(internal("an ended encoder's call")),
+                 })
+             }
