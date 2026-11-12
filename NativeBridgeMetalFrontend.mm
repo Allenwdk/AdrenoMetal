@@ -38,6 +38,7 @@
 #include <execinfo.h>
 #include <mach/mach.h>
 #include <thread>
+#include <cerrno>
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/time.h>
@@ -334,6 +335,41 @@ struct DetailSpan {
 static uint64_t encodeCommandOf(id);
 static char encodeRenderModeOf(id);
 static void traceStartWriter();
+
+static bool writeTraceBytes(int fd,const void *data,size_t length) {
+ const auto *bytes=static_cast<const uint8_t *>(data);
+ while(length) {
+  const ssize_t n=write(fd,bytes,length);
+  if(n<0 && errno==EINTR)continue;
+  if(n<=0)return false;
+  bytes+=n;length-=size_t(n);
+ }
+ return true;
+}
+
+static int openFrameTrace(const char *path,bool rotate,uint32_t next,uint64_t dropped) {
+ char previous[256],staging[256];
+ const int n=snprintf(previous,sizeof previous,"%s",path);
+ if(n<0 || size_t(n)>=sizeof previous || n<6)return -1;
+ // frames.trace -> frames.previous.trace, next to the current segment.
+ const int p=snprintf(previous+n-6,sizeof previous-size_t(n-6),".previous.trace");
+ const int s=snprintf(staging,sizeof staging,"%s.new",path);
+ if(p<0 || size_t(p)>=sizeof previous-size_t(n-6) || s<0 || size_t(s)>=sizeof staging)return -1;
+ const int fd=open(staging,O_WRONLY|O_CREAT|O_TRUNC,0644);
+ if(fd<0)return -1;
+ struct timeval wall={};gettimeofday(&wall,nullptr);
+ TraceRec header[2]={};
+ header[0].t0=nowUs();header[0].t1=uint64_t(wall.tv_sec)*1000000+wall.tv_usec;
+ header[0].t2=next;header[0].t3=dropped;
+ header[0].b=uint32_t(getpid());header[0].c=uint32_t(wall.tv_sec);header[0].d=2;
+ header[1].type=26;header[1].t0=header[0].t0;header[1].a=19200000;header[1].b=1;
+ if(!writeTraceBytes(fd,header,sizeof header) ||
+    (rotate && rename(path,previous) && errno!=ENOENT) || rename(staging,path)) {
+  close(fd);unlink(staging);return -1;
+ }
+ if(!rotate)unlink(previous);
+ return fd;
+}
 // type 5 swap served by the scanout client: {idx, t0 offer arrived, t1 GPU copy returned, t2 swap completed, a sequence, b result}
 extern "C" void NBTraceSwap(uint64_t offered,uint64_t copied,uint64_t completed,uint32_t sequence,uint32_t result) {
  TraceRec rec={};rec.type=5;rec.t0=offered;rec.t1=copied;rec.t2=completed;rec.a=sequence;rec.b=result;tracePush(rec);
@@ -374,12 +410,15 @@ static void traceStartWriter() {
  std::thread([]{
   pthread_setname_np("frame-trace");
   int fd=-1;
+  const char *tracePath=nullptr;
   // The render server's trace file: backboardd's cache on iPadOS; on macOS a directory of its own under /private/var/tmp, which
   // WindowServer may write (its shader cache lies beside it).
   static const char *const paths[]={"/private/var/mobile/Library/Caches/com.apple.backboardd/m2v/frames.trace","/private/var/root/Library/Caches/com.apple.backboardd/m2v/frames.trace",
    "/private/var/tmp/NativeAdrenoMetal.trace/frames.trace"};
   mkdir("/private/var/tmp/NativeAdrenoMetal.trace",0755);
   uint32_t written=0;
+  uint64_t dropped=0,fileBytes=0,syncedBytes=0;
+  uint32_t turns=0;
   struct PassRec {uint64_t ns;uint32_t seq;uint16_t width,height;uint8_t mode,colors,flags,swap;uint16_t draws,format;uint32_t kpx;uint64_t gpuBegin,gpuEnd;uint16_t fsInstrs,fsTex,fsSy,fsSs;int8_t fsWaves,fsRegs;uint8_t samples,ds;uint32_t bandwidth,verts,fsHash;};
   struct SubRec {uint64_t ns;uint32_t seq,fence,syncWaitUs,callUs,spaceWaitUs;uint16_t busy;uint8_t chunks,buffers;};
   static_assert(sizeof(PassRec)==72 && sizeof(SubRec)==32,"turnip ring records");
@@ -389,10 +428,12 @@ static void traceStartWriter() {
   uint32_t (*subRead)(uint32_t,SubRec *,uint32_t,uint32_t *)=nullptr;
   void (*copyStats)(uint64_t *)=nullptr;
   uint64_t copyLast[16]={};
-  bool header=false;
   for(;;) {
    usleep(250000);
-   if(render && fd<0)for(const char *path:paths){fd=open(path,O_WRONLY|O_CREAT|O_TRUNC,0644);if(fd>=0)break;}
+   if(render && fd<0)for(const char *path:paths) {
+    fd=openFrameTrace(path,false,written,dropped);
+    if(fd>=0){tracePath=path;fileBytes=2*sizeof(TraceRec);break;}
+   }
    if(render && fd<0)continue;
    if((diagOn() || getenv("SHENG_PER_PASS")) && !turnip && !gLoaderPath.empty()) {
     turnip=dlopen(gLoaderPath.c_str(),RTLD_NOW|RTLD_NOLOAD);
@@ -403,13 +444,6 @@ static void traceStartWriter() {
       copyStats=(void (*)(uint64_t *))dlsym(turnip,"tu_copy_row_stats");
      }
     }
-   }
-   if(render && !header) {
-    header=true;
-    struct timeval wall;gettimeofday(&wall,nullptr);
-    TraceRec rec={};rec.type=0;rec.t0=nowUs();rec.t1=(uint64_t)wall.tv_sec*1000000ull+(uint64_t)wall.tv_usec;rec.b=(uint32_t)getpid();rec.c=(uint32_t)wall.tv_sec;rec.d=2;tracePush(rec);
-    // Type26 identifies exact-rational pass timestamps; legacy exports used integer 52 ns/tick.
-    TraceRec clock={};clock.type=26;clock.t0=nowUs();clock.a=19200000;clock.b=1;tracePush(clock);
    }
    // Turnip's own rings (render passes, kernel submissions) go into the same file, in the order they are read.
    if(passRead) {
@@ -500,22 +534,28 @@ static void traceStartWriter() {
    uint32_t head=gTraceHead.load();
    if(head<written+4)continue;
    head-=4;                                   // records still being filled stay for the next round
-   if(head-written>16000)written=head-16000;   // the ring lapped the writer: the oldest are gone
-   // The file stops growing at kFramesTraceCap (64 MiB): it stays within half of the diagnostic export region, and Data never
-   // holds more than that of it. Later records are dropped.
-   static constexpr uint64_t kFramesTraceCap=64ull<<20;
-   static uint64_t fileBytes=0;
+   if(head-written>16000){dropped+=head-written-16000;written=head-16000;}
+   // Keep the two newest segments within the diagnostic export's file budget.
+   static constexpr uint64_t kFramesTraceCap=16ull<<20;
    while(written<head){
     uint32_t n=head-written;const uint32_t room=16384-written%16384;if(n>room)n=room;
     const uint64_t left=(kFramesTraceCap-fileBytes)/sizeof(TraceRec);
-    if(!left){written=head;break;}
+    if(!left) {
+     if(fsync(fd))break;
+     const int next=openFrameTrace(tracePath,true,written,dropped);
+     if(next<0)break;
+     close(fd);fd=next;fileBytes=2*sizeof(TraceRec);syncedBytes=0;
+     continue;
+    }
     if(n>left)n=(uint32_t)left;
-    if(write(fd,&gTrace[written%16384],n*sizeof(TraceRec))<0)break;
+    if(!writeTraceBytes(fd,&gTrace[written%16384],n*sizeof(TraceRec))) {
+     if(ftruncate(fd,off_t(fileBytes)) || lseek(fd,off_t(fileBytes),SEEK_SET)<0){close(fd);return;}
+     break;
+    }
     written+=n;fileBytes+=n*sizeof(TraceRec);
    }
    // A test boot ends in a reset, not a shutdown: what was written reaches the disk every two seconds at the latest.
-   static uint64_t syncedBytes=0;static uint32_t turns=0;
-   if(++turns%8==0 && syncedBytes!=fileBytes){fsync(fd);syncedBytes=fileBytes;}
+   if(++turns%8==0 && syncedBytes!=fileBytes && !fsync(fd))syncedBytes=fileBytes;
   }
  }).detach();
 }
