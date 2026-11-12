@@ -59,6 +59,8 @@ With `diag=1`, the render server sends its telemetry table to the kernel log (`[
 
 With `gpu-trace=1`, the render server writes command phases, encoding batches, attachments and Turnip pass timings to its frame trace. Kernel event 63 identifies the render, encode and completion threads. In `iconservicesagent`, event 65 records the Metal device and queue, then up to eight completed command buffers containing draws or dispatches. Each work record includes the command buffer status and draw and dispatch counts. [GPU frame diagnostics](https://unixnu.com/porting/gpu-diagnostics)
 
+Frame records rotate between `frames.trace` and `frames.previous.trace`, up to 16 MiB each. Each segment starts with the process, clock calibration, next record index and cumulative overwritten-record count. The writer retries interrupted and short writes and syncs every two seconds while data changes.
+
 `sheng-diag=2` records backboardd command summaries, commit-to-encode timing and scanout-client events in the frame trace. Turnip and the runtime use their ordinary path without per-pass stamps or detailed diagnostics. Kernel tracing is configured separately.
 
 `sheng-wallpaper-freeze=1` enables wallpaper isolation. A Poster renderer freezes GPU submission after a successful command draws into and stores an IOSurface of at least two million pixels. The completed output stays retained. Later commands remain committed and unscheduled, with their resources and queue leases retained. Already submitted work completes normally. PosterBoard and other processes keep submitting. The switch defaults to off; `NATIVE_METAL_FREEZE_WALLPAPER=1` selects the same mode directly in a renderer process.
