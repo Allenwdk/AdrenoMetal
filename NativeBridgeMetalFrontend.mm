@@ -347,6 +347,11 @@ static bool writeTraceBytes(int fd,const void *data,size_t length) {
  return true;
 }
 
+static void syncFrameTrace(int fd,uint64_t bytes,uint64_t &synced,uint64_t &lastUs) {
+ const uint64_t now=nowUs();
+ if(bytes!=synced && now-lastUs>=1000000 && !fsync(fd)){synced=bytes;lastUs=nowUs();}
+}
+
 static int openFrameTrace(const char *path,bool rotate,uint32_t next,uint64_t dropped) {
  char previous[256],staging[256];
  const int n=snprintf(previous,sizeof previous,"%s",path);
@@ -417,8 +422,7 @@ static void traceStartWriter() {
    "/private/var/tmp/NativeAdrenoMetal.trace/frames.trace"};
   mkdir("/private/var/tmp/NativeAdrenoMetal.trace",0755);
   uint32_t written=0;
-  uint64_t dropped=0,fileBytes=0,syncedBytes=0;
-  uint32_t turns=0;
+  uint64_t dropped=0,fileBytes=0,syncedBytes=0,lastSyncUs=0;
   struct PassRec {uint64_t ns;uint32_t seq;uint16_t width,height;uint8_t mode,colors,flags,swap;uint16_t draws,format;uint32_t kpx;uint64_t gpuBegin,gpuEnd;uint16_t fsInstrs,fsTex,fsSy,fsSs;int8_t fsWaves,fsRegs;uint8_t samples,ds;uint32_t bandwidth,verts,fsHash;};
   struct SubRec {uint64_t ns;uint32_t seq,fence,syncWaitUs,callUs,spaceWaitUs;uint16_t busy;uint8_t chunks,buffers;};
   static_assert(sizeof(PassRec)==72 && sizeof(SubRec)==32,"turnip ring records");
@@ -435,6 +439,7 @@ static void traceStartWriter() {
     if(fd>=0){tracePath=path;fileBytes=2*sizeof(TraceRec);break;}
    }
    if(render && fd<0)continue;
+   if(render)syncFrameTrace(fd,fileBytes,syncedBytes,lastSyncUs);
    if((diagOn() || getenv("SHENG_PER_PASS")) && !turnip && !gLoaderPath.empty()) {
     turnip=dlopen(gLoaderPath.c_str(),RTLD_NOW|RTLD_NOLOAD);
     if(turnip) {
@@ -554,8 +559,9 @@ static void traceStartWriter() {
     }
     written+=n;fileBytes+=n*sizeof(TraceRec);
    }
-   // A test boot ends in a reset, not a shutdown: what was written reaches the disk every two seconds at the latest.
-   if(++turns%8==0 && syncedBytes!=fileBytes && !fsync(fd))syncedBytes=fileBytes;
+   // Use elapsed time, including idle turns. Counting nonempty batches left
+   // a final partial batch unsynced indefinitely when producers stopped.
+   syncFrameTrace(fd,fileBytes,syncedBytes,lastSyncUs);
   }
  }).detach();
 }
