@@ -348,13 +348,14 @@ static id deviceForPort(unsigned port) {
         }
         // Turnip chooses each pass's rendering: tile memory (GMEM) or system memory, by its own rules (a pass with a memoryless
         // attachment or a feedback loop in tile memory, a pass of few draws in system memory, the others by the bandwidth each would
-        // take), with concurrent binning. A pass in system memory has no tile load and store, which is what a screen-size pass that
+        // take). A pass in system memory has no tile load and store, which is what a screen-size pass that
         // draws on a small part of its target otherwise pays for whole. The colour order of GMEM loads and stores is the image's own
         // swap on the memory side (patches/mesa/turnip-gmem-memory-side-swap.patch). The RM row of the memory log counts both kinds;
         // tu-debug= (for instance gmem,nocb: every pass in tile memory, no concurrent binning) overrides this.
         // Concurrent binning is a Turnip option that is off unless asked for (tu_allow_concurrent_binning, read from the environment
-        // by Mesa's option parser): with it the BV thread bins a pass while BR still renders the one before. nocb in tu-debug= turns it off.
-        setenv("tu_allow_concurrent_binning", "true", 0);
+        // by Mesa's option parser): with it the BV thread bins a pass while BR still renders the one before. tu-cb=1 turns it on.
+        // It stays at Mesa's default, off: what it gains here was never measured.
+        if (bootArgSet("tu-cb=1")) setenv("tu_allow_concurrent_binning", "true", 0);
         // diag=1 turns on every diagnostic of the GPU stack in this process: the frontend's frame trace, Turnip's pass stamps and
         // submission ring, the runtime's stage ring, and in the render server the status and telemetry lines. Without it none of them runs.
         if (bootArgSet("diag=1") || bootArgSet("gpu-trace=1")) setenv("SHENG_DIAG", "1", 1);
@@ -371,6 +372,11 @@ static id deviceForPort(unsigned port) {
         // for a comparison on the same image. Read by the bridge at the first such texture.
         if (bootArgSet("gpu-ycbcr-planes=0")) setenv("NATIVE_METAL_YCBCR_PLANES", "0", 1);
         else unsetenv("NATIVE_METAL_YCBCR_PLANES");
+        // Turnip compiles inside vkCreate*Pipelines on the calling thread: the runtime makes the call there instead of on a thread it
+        // starts for it (its relay exists for a driver whose compiler service takes the asking thread's class).
+        setenv("METAL2VULKAN_COMPILE_ON_ASKING_THREAD", "1", 1);
+        // metal-tile=1: the device also answers the family that has tile shaders (bridge: tile_shaders_offered).
+        if (bootArgSet("metal-tile=1")) setenv("NATIVE_METAL_TILE", "1", 1); else unsetenv("NATIVE_METAL_TILE");
         {
             // metal-flow=<bits>: 1 the lowering thread, 2 commit submission, 4 the warm pass; all three without the argument.
             char args[1100] = {}, flow[16] = "";
