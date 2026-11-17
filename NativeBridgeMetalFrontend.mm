@@ -977,17 +977,20 @@ static NSString *compileArguments(MTLCompileOptions *options) {
  const NSUInteger version=options && options.languageVersion?(NSUInteger)options.languageVersion:(NSUInteger)MTLLanguageVersion3_1;
  const unsigned major=(unsigned)(version>>16),minor=(unsigned)(version&0xffff);
  [arguments addObject:[NSString stringWithFormat:major>=3?@"-std=metal%u.%u":@"-std=ios-metal%u.%u",major,minor]];
+ // The newer compile-option selectors are reached dynamically with the iOS 17 SDK.
+ enum : NSInteger { MathModeSafe = 0, MathModeRelaxed = 1, MathModeFast = 2 };
+ enum : NSInteger { MathFunctionsFast = 0, MathFunctionsPrecise = 1 };
  const SEL modeSelector=sel_registerName("mathMode"),functionsSelector=sel_registerName("mathFloatingPointFunctions");
  NSString *modeName=nil,*functionsName=nil;
  if([options respondsToSelector:modeSelector] && [options respondsToSelector:functionsSelector]) {
   switch(((NSInteger (*)(id,SEL))objc_msgSend)(options,modeSelector)) {
-   case MTLMathModeSafe:modeName=@"safe";break;
-   case MTLMathModeRelaxed:modeName=@"relaxed";break;
-   case MTLMathModeFast:modeName=@"fast";break;
+   case MathModeSafe:modeName=@"safe";break;
+   case MathModeRelaxed:modeName=@"relaxed";break;
+   case MathModeFast:modeName=@"fast";break;
   }
   switch(((NSInteger (*)(id,SEL))objc_msgSend)(options,functionsSelector)) {
-   case MTLMathFloatingPointFunctionsFast:functionsName=@"fast";break;
-   case MTLMathFloatingPointFunctionsPrecise:functionsName=@"precise";break;
+   case MathFunctionsFast:functionsName=@"fast";break;
+   case MathFunctionsPrecise:functionsName=@"precise";break;
   }
  }
  if(modeName && functionsName) {
