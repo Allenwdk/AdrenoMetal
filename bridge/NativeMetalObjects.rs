@@ -71,8 +71,10 @@ fn guard<T>(fallback: T, body: impl FnOnce() -> Result<T, String>) -> T {
             set_error(why);
             fallback
         }
-        Err(_) => {
-            set_error("panic in the Metal runtime".into());
+        Err(payload) => {
+            let why = payload.downcast_ref::<String>().map(String::as_str)
+                .or_else(|| payload.downcast_ref::<&str>().copied()).unwrap_or("unknown panic payload");
+            set_error(format!("panic in the Metal runtime: {why}"));
             fallback
         }
     }
@@ -249,13 +251,14 @@ impl PipelineRecords {
     }
 }
 
-/// The work placement the bridge asks of the runtime, as bits: 1 render encoder calls lowered on the device's lowering thread,
-/// 2 a command buffer submitted at its commit (`commit_and_submit`), 4 the warm pass over the pipeline records of earlier
-/// processes. All three by default; `NATIVE_METAL_FLOW=<number>` (the boot argument `metal-flow=<number>`) states the bits, 0 none.
+/// Work placement: bit 1 lowers on the device's worker, bit 2 submits at commit.
+/// iPadOS also supports bit 4 for warming earlier pipeline records. Defaults are
+/// 3 on macOS and 7 on iPadOS; `NATIVE_METAL_FLOW` selects the bits.
 fn flow_bits() -> u32 {
     static BITS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *BITS.get_or_init(|| {
-        std::env::var("NATIVE_METAL_FLOW").ok().and_then(|value| value.trim().parse::<u32>().ok()).unwrap_or(7)
+        let bits = std::env::var("NATIVE_METAL_FLOW").ok().and_then(|value| value.trim().parse::<u32>().ok()).unwrap_or(7);
+        if cfg!(target_os = "macos") { bits & 3 } else { bits }
     })
 }
 
@@ -273,13 +276,8 @@ pub unsafe extern "C" fn nmb_device_open(loader: *const c_char, cache: *const c_
         options.loader = Some(PathBuf::from(loader.to_string_lossy().into_owned()));
         options.shader_cache = metal2vulkan_runtime::ShaderCacheOptions::in_directory(cache.to_string_lossy().into_owned());
         options.messages = Some(MessageSink::new(observe_message));
-        // A texture over host pages or a buffer whose rows lie apart is an image over the bytes, rendered or written too: the window
-        // server's surfaces and padded framebuffers (3048x2032 BGRA8 at 12288-byte rows, int-251) were otherwise copied in and out of a
-        // shadow image every pass.
+        // Render imported surfaces and padded buffers directly under the board policy.
         options.policy.host_page_textures = metal2vulkan::device::HostPageTexturePolicy::InPlaceWrites;
-        // Metal makes a pipeline state's pipeline at its creation and never drops a draw for a pipeline being made; the runtime's
-        // default (PipelineWaitPolicy::Bounded) drops the draws and dispatches of a pipeline not made 4.5 s after the commit, which the
-        // render server showed as missing pieces of the screen while it compiled (int 590aaee2).
         options.policy.pipeline_waits = metal2vulkan::device::PipelineWaitPolicy::Exact;
         // Render encoder calls are checked at the call and lowered on the device's lowering thread, so the program's thread does not
         // pay for them (the render server's main thread spent most of the plugin's CPU time lowering). A refusal only the lowering
@@ -294,7 +292,13 @@ pub unsafe extern "C" fn nmb_device_open(loader: *const c_char, cache: *const c_
         // Every texture given a shadow image is announced with why no image aliases its bytes (`shadow.log`).
         options.announce_each.insert(metal2vulkan_runtime::Degradation::ShadowedTexture);
         let _ = SHADOW_LOG.set(PathBuf::from(cache.to_string_lossy().into_owned()).join("shadow.log"));
+        open_runtime_diagnostics(cache.to_string_lossy().as_ref());
         let device = Device::system_default_with(&options).map_err(e("device"))?;
+        if std::env::var("NATIVE_METAL_TILING_CHECK").as_deref() == Ok("1") {
+            let settled = device.settle_tiling_cost_check(std::time::Duration::from_secs(3));
+            eprintln!("native-metal tiling-check settled={settled}: {}", device.tiling_cost_check_report());
+        }
+        write_runtime_policy(&device);
         // No caller moves or detaches the pages of a no-copy buffer (the frontend has no rebind or detach): the encoders log no calls
         // to encode again and hold no surface's buffer per command, which every frame of the render server paid for.
         device.refuse_rebinds();
@@ -346,6 +350,53 @@ fn note_shadow(text: &str) {
 // NATIVE_METAL_WARNINGS=1: each kind of message (its id and the text's first 48 characters) the first time it comes, in full and
 // with its severity, to standard error, for the first 400 kinds. The telemetry keeps only the last warning, and a degradation that
 // draws nothing is otherwise silent.
+const TIMING_LOG_LIMIT: usize = 512 * 1024;
+struct TimingLog { file: std::fs::File, bytes: usize }
+static TIMING_LOG: std::sync::OnceLock<std::sync::Mutex<TimingLog>> = std::sync::OnceLock::new();
+static POLICY_LOG: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+fn open_runtime_diagnostics(cache: &str) {
+    if std::env::var_os("SHENG_DIAG").is_none() { return; }
+    let root = PathBuf::from(cache);
+    let _ = POLICY_LOG.set(root.join("runtime-policy.log"));
+    if let Ok(file) = std::fs::OpenOptions::new().create(true).append(true).open(root.join("timing.log")) {
+        let bytes = file.metadata().map_or(0, |m| m.len() as usize);
+        let _ = TIMING_LOG.set(std::sync::Mutex::new(TimingLog { file, bytes }));
+    }
+}
+
+fn diagnostic_stamp() -> String {
+    let boot = std::env::var("NATIVE_METAL_BOOT_SESSION").unwrap_or_else(|_| "unknown".into());
+    let build = option_env!("NMB_COMPONENT_ID").unwrap_or("host-working-tree");
+    let uptime = metal2vulkan_runtime::stage_trace::now_nanos() / 1000;
+    let time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_micros());
+    format!("boot={boot} build={build} runtime={} uptime_us={uptime} time_us={time}", env!("NMB_RUNTIME_ID"))
+}
+
+fn write_runtime_policy(device: &Device) {
+    let Some(path) = POLICY_LOG.get() else { return; };
+    let profile = device.compile_device();
+    let text = format!("{}\npolicy={:#?}\nsubmit={}\nqueue-switch={}\nin-place={:#?}\ntiling-cost={}\nprofile={:#?}\n",
+        diagnostic_stamp(), profile.policy(), device.submit_check_report(),
+        device.queue_switch_check_report(), device.in_place_check_report(),
+        device.tiling_cost_check_report(), profile.profile());
+    let text: String = text.chars().take(64 * 1024).collect();
+    let _ = std::fs::write(path, text);
+}
+
+fn note_encoder_timing(text: &str) {
+    use std::io::Write;
+    let Some(log) = TIMING_LOG.get() else { return; };
+    let Ok(mut log) = log.lock() else { return; };
+    let text: String = text.chars().take(4096).collect();
+    let line = format!("{} {text}\n", diagnostic_stamp());
+    if log.bytes + line.len() > TIMING_LOG_LIMIT {
+        if log.file.set_len(0).is_err() { return; }
+        log.bytes = 0;
+    }
+    if log.file.write_all(line.as_bytes()).is_ok() { log.bytes += line.len(); }
+}
+
 fn log_message(message: &DebugMessage) {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     static SEEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
@@ -391,6 +442,7 @@ fn observe_message(message: &DebugMessage) {
             }
         }
     }
+    if message.id_name == "metal2vulkan-encoder-times" { note_encoder_timing(&message.text); }
     if message.id_name == "shadowed-texture" {
         note_shadow(&message.text);
     }
@@ -464,8 +516,8 @@ pub extern "C" fn nmb_device_shader_cache_detail(device: *const NmbDevice, out: 
             c.misses,
             c.function_hits,
             c.function_misses,
-            c.compute_pipeline_hits,
-            c.compute_pipeline_misses,
+            c.driver_data_found,
+            c.driver_data_unchanged,
             c.render_pipeline_hits,
             c.render_pipeline_misses,
             c.rejected,
@@ -481,6 +533,8 @@ pub extern "C" fn nmb_device_shader_cache_detail(device: *const NmbDevice, out: 
             c.driver_pipeline_hits,
             c.driver_pipeline_misses,
             c.driver_saves,
+            c.driver_data_truncated,
+            c.driver_data_mismatched,
         ];
         out.fill(0);
         out[..words.len()].copy_from_slice(&words);
@@ -525,6 +579,31 @@ pub extern "C" fn nmb_device_flow_counts(device: *const NmbDevice, out: *mut u64
     })
 }
 
+/// Submission grouping, command-pool reuse, in-place passes and commit costs, into the header's fifteen words.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_device_fast_path_counts(device: *const NmbDevice, out: *mut u64) -> bool {
+    guard(false, || {
+        if out.is_null() {
+            return Err("null counts".into());
+        }
+        // SAFETY: the header's fifteen writable words.
+        let out = unsafe { std::slice::from_raw_parts_mut(out, 15) };
+        let device = &get(device)?.0;
+        static SNAPSHOTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        if POLICY_LOG.get().is_some() && SNAPSHOTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 32 == 0 {
+            write_runtime_policy(device);
+        }
+        let w = device.work_counts();
+        out.copy_from_slice(&[w.grouped_submissions, w.batches_grouped, w.command_pools_made,
+                              w.spare_command_pools_taken, w.linear_passes_in_place, w.linear_passes_through_copies,
+                              w.region_pipelines_evicted, w.commit_calls, w.commit_nanos / 1000,
+                              w.commit_lowering_nanos / 1000, w.commit_recording_nanos / 1000,
+                              w.commit_pipeline_wait_nanos / 1000, w.commit_lock_wait_nanos / 1000,
+                              w.commit_pass_nanos / 1000, w.commit_submit_nanos / 1000]);
+        Ok(true)
+    })
+}
+
 /// Where render passes cost the GPU more than Metal's single pass in tile memory, into the caller's ten words: passes begun as
 /// instances, passes split inline, then instance splits for a barrier, tile memory, a memoryless write and a pending pipeline, stand-ins
 /// made and their bytes, and stand-in copies made and those made at draws.
@@ -563,7 +642,7 @@ pub extern "C" fn nmb_device_memory_counts(device: *const NmbDevice, out: *mut u
     })
 }
 
-/// The runtime's live blocks of its own device memory by what holds them and by size (bridge patch 0031), into the caller's 48 words:
+/// The runtime's live blocks of its own device memory by what holds them and by size, into the caller's 48 words:
 /// seven size classes each (at most 16, 32, 40, 48, 56 and 64 MiB, and larger) of the pooled blocks with a placement, the pooled
 /// blocks kept empty, the spare image blocks, the dedicated blocks of an image and those of a buffer; then the bytes of the spare
 /// blocks and of the dedicated blocks of images and of buffers; then, of the blocks of a lazily allocated memory type, those with a
@@ -1476,6 +1555,7 @@ pub struct NmbTextureDescriptor {
     pub framebuffer_only: u64,
     pub is_drawable: u64,
     pub swizzle: u64,
+    pub allow_gpu_optimized_contents: u64,
 }
 
 // Bit 32 distinguishes an explicit all-zero swizzle from an omitted descriptor field.
@@ -1505,8 +1585,30 @@ fn texture_descriptor(d: *const NmbTextureDescriptor) -> Result<TextureDescripto
     out.rotation = d.rotation;
     out.framebuffer_only = d.framebuffer_only != 0;
     out.is_drawable = d.is_drawable != 0;
+    out.allow_gpu_optimized_contents = d.allow_gpu_optimized_contents != 0;
     if let Some(swizzle) = swizzle_of(d.swizzle)? { out.swizzle = swizzle; }
     Ok(out)
+}
+
+#[cfg(test)]
+mod texture_descriptor_tests {
+    use super::*;
+
+    #[test]
+    fn heap_layout_preserves_the_callers_optimization_policy() {
+        let mut descriptor = NmbTextureDescriptor {
+            kind: TextureType::Type2D.as_raw() as u64,
+            format: PixelFormat::RGBA16Float.as_raw() as u64,
+            width: 242, height: 242, depth: 1, levels: 1, samples: 1, array_length: 1,
+            usage: TextureUsage::SHADER_READ.as_raw() as u64,
+            options: ResourceOptions::private().raw(),
+            rotation: 0, framebuffer_only: 0, is_drawable: 0, swizzle: 0,
+            allow_gpu_optimized_contents: 0,
+        };
+        assert!(!texture_descriptor(&descriptor).unwrap().allow_gpu_optimized_contents);
+        descriptor.allow_gpu_optimized_contents = 1;
+        assert!(texture_descriptor(&descriptor).unwrap().allow_gpu_optimized_contents);
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -1680,6 +1782,7 @@ pub extern "C" fn nmb_texture_describe(texture: *const NmbTexture, out: *mut Nmb
             framebuffer_only: u64::from(t.framebuffer_only()),
             is_drawable: u64::from(t.is_drawable()),
             swizzle: swizzle_packed(t.swizzle()),
+            allow_gpu_optimized_contents: u64::from(t.allow_gpu_optimized_contents()),
         };
         Ok(())
     })
@@ -1929,6 +2032,28 @@ pub extern "C" fn nmb_function_release(function: *mut NmbFunction) {
 #[unsafe(no_mangle)]
 pub extern "C" fn nmb_function_type(function: *const NmbFunction) -> u64 {
     guard(0, || Ok(get(function)?.0.function_type().map_err(e("function type"))?.as_raw() as u64))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_function_attribute_count(function: *const NmbFunction) -> i32 {
+    guard(-1, || Ok(get(function)?.0.stage_input_attributes().map_err(e("function attributes"))?.map_or(0, |a| a.len() as i32)))
+}
+
+/// # Safety
+/// `name` has `capacity` writable bytes and `facts` holds five writable words.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nmb_function_attribute_at(function: *const NmbFunction, at: u32, name: *mut c_char,
+                                                capacity: usize, facts: *mut u64) -> usize {
+    guard(0, || {
+        let attributes = get(function)?.0.stage_input_attributes().map_err(e("function attributes"))?.unwrap_or_default();
+        let a = attributes.get(at as usize).ok_or("function attribute index")?;
+        if facts.is_null() { return Err("null attribute facts".into()); }
+        let values = [a.attribute_index() as u64, a.attribute_type().as_raw() as u64, a.is_active() as u64,
+                      a.is_patch_data() as u64, a.is_patch_control_point_data() as u64];
+        // SAFETY: the caller supplies five writable words.
+        unsafe { std::ptr::copy_nonoverlapping(values.as_ptr(), facts, values.len()); }
+        Ok(copy_out(a.name(), name, capacity))
+    })
 }
 
 /// `patchType`: 0 (none) for a function other than a post-tessellation vertex function.
@@ -2749,7 +2874,8 @@ pub extern "C" fn nmb_command_buffer_wait_scheduled(command_buffer: *mut NmbComm
 
 #[unsafe(no_mangle)]
 pub extern "C" fn nmb_command_buffer_commit(command_buffer: *mut NmbCommandBuffer) -> bool {
-    guard(false, || {
+    let began = TIMING_LOG.get().map(|_| std::time::Instant::now());
+    let result = guard(false, || {
         // The committing thread submits where no other pass is under way, with no wake of the scheduler thread between commit and GPU.
         let command_buffer = &get(command_buffer)?.0;
         if flow_bits() & 2 != 0 {
@@ -2758,7 +2884,14 @@ pub extern "C" fn nmb_command_buffer_commit(command_buffer: *mut NmbCommandBuffe
             command_buffer.commit().map_err(e("commit"))?;
         }
         Ok(true)
-    })
+    });
+    if let Some(began) = began {
+        let nanos = began.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+        if nanos >= 8_000_000 {
+            note_encoder_timing(&format!("command_buffer={command_buffer:p} commit_us={} accepted={result}", nanos / 1000));
+        }
+    }
+    result
 }
 
 #[unsafe(no_mangle)]

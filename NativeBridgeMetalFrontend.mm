@@ -5,7 +5,6 @@
 // Every result comes from the runtime and the GPU: a refused call returns nil/NO with the runtime's reason, an encoder call the runtime
 // refuses fails its command buffer (status Error, handlers run) instead of being dropped. A selector this frontend does not implement is
 // reported through the missing-selector hook before the usual exception, so a hardware run names the gap.
-// Shared events work within this process (no cross-process handle yet). Not yet implemented here: heaps, argument buffers, indirect commands, drawables/presentation.
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #import <IOSurface/IOSurfaceRef.h>
@@ -19,6 +18,7 @@
 #include <deque>
 #include <condition_variable>
 #include <cmath>
+#include <cstdarg>
 #include <atomic>
 #include <optional>
 #include <mutex>
@@ -665,7 +665,7 @@ static bool isRenderServer() {return nativeIsRenderServer();}
 static void endRenderServerAfterGpuLoss() {
  static std::atomic<bool> ending{false};
  if(!isRenderServer() || ending.exchange(true))return;
- NBLOG(@"native-metal: the render server's GPU context is lost; ending backboardd so launchd starts it again");
+ NBLOG(@"native-metal: the render server's GPU context is lost; ending %s so launchd starts it again",NATIVE_RENDER_SERVER);
  dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(500*NSEC_PER_MSEC)),dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE,0),^{
   kill(getpid(),SIGTERM);
  });
@@ -709,6 +709,7 @@ static void logTexture(const char *kind,MTLTextureDescriptor *d,IOSurfaceRef sur
 // planes, requested plane, plane offset, plane row bytes and allocation, and the descriptor's size and pixel format.
 struct SurfaceRefusal {uint32_t step,format,planes,plane,pixelFormat;uint64_t offset,row,allocation,width,height,surfaceWidth,surfaceHeight,rotation;bool framebufferOnly;};
 static SurfaceRefusal gSurfaceLastRefusal;
+#if !TARGET_OS_OSX
 // Shader priming's progress (PrimeShaders.h, in the plugin), for the PR row. Weak here: the plugin's own definition wins, and a host
 // binary that links the frontend without the plugin (every check-*-host.py test) has zeroes instead of an undefined symbol.
 extern "C" {
@@ -720,8 +721,14 @@ __attribute__((weak)) volatile uint32_t native_prime_rate;
 __attribute__((weak)) volatile uint32_t native_prime_functions_resumed;
 __attribute__((weak)) volatile uint32_t native_prime_libraries_primed;   // libraries this process's passes compiled
 __attribute__((weak)) volatile uint32_t native_prime_libraries_skipped;  // other GPUs' driver bundles (whole system) or not loaded here
+__attribute__((weak)) volatile uint32_t native_prime_pass_complete;
+__attribute__((weak)) volatile uint32_t native_prime_libraries_failed;
+__attribute__((weak)) volatile uint32_t native_prime_functions_refused;
+__attribute__((weak)) volatile uint32_t native_prime_functions_skipped;
+__attribute__((weak)) volatile uint32_t native_prime_inventory_failed;
 __attribute__((weak)) volatile uint32_t native_prime_scope;              // 0 no pass yet, 1 loaded bundles only, 2 the whole system
 }
+#endif
 static void refuseSurface(uint32_t step,IOSurfaceRef surface,MTLTextureDescriptor *d,NSUInteger plane,uint64_t offset,uint64_t row) {
  gSurfaceRefusals++;
  SurfaceRefusal r={step,surface?IOSurfaceGetPixelFormat(surface):0,surface?(uint32_t)IOSurfaceGetPlaneCount(surface):0,(uint32_t)plane,
@@ -957,7 +964,7 @@ static NSData *compileMetalSource(NSString *source,NSString *arguments,NSString 
  memcpy(request.data()+16,text.bytes,text.length);memcpy(request.data()+16+sourceBytes,options,optionBytes);
  return codeGenRequest(13,request,warnings,failure);
 }
-// The front end's arguments for a set of compile options, as Metal passes them: the language version, fast math (Metal's default),
+// The front end's arguments for a set of compile options, as Metal passes them: the language version, math mode and FP32 functions,
 // invariance, size optimization and the preprocessor macros; module caches in this process's temporary directory, which a sandboxed
 // client may write.
 static NSString *compileArgument(NSString *text) {
@@ -970,8 +977,26 @@ static NSString *compileArguments(MTLCompileOptions *options) {
  const NSUInteger version=options && options.languageVersion?(NSUInteger)options.languageVersion:(NSUInteger)MTLLanguageVersion3_1;
  const unsigned major=(unsigned)(version>>16),minor=(unsigned)(version&0xffff);
  [arguments addObject:[NSString stringWithFormat:major>=3?@"-std=metal%u.%u":@"-std=ios-metal%u.%u",major,minor]];
- const BOOL fast=options?((BOOL (*)(id,SEL))objc_msgSend)(options,sel_registerName("fastMathEnabled")):YES;
- [arguments addObject:fast?@"-ffast-math":@"-fno-fast-math"];
+ const SEL modeSelector=sel_registerName("mathMode"),functionsSelector=sel_registerName("mathFloatingPointFunctions");
+ NSString *modeName=nil,*functionsName=nil;
+ if([options respondsToSelector:modeSelector] && [options respondsToSelector:functionsSelector]) {
+  switch(((NSInteger (*)(id,SEL))objc_msgSend)(options,modeSelector)) {
+   case MTLMathModeSafe:modeName=@"safe";break;
+   case MTLMathModeRelaxed:modeName=@"relaxed";break;
+   case MTLMathModeFast:modeName=@"fast";break;
+  }
+  switch(((NSInteger (*)(id,SEL))objc_msgSend)(options,functionsSelector)) {
+   case MTLMathFloatingPointFunctionsFast:functionsName=@"fast";break;
+   case MTLMathFloatingPointFunctionsPrecise:functionsName=@"precise";break;
+  }
+ }
+ if(modeName && functionsName) {
+  [arguments addObject:[@"-fmetal-math-mode=" stringByAppendingString:modeName]];
+  [arguments addObject:[@"-fmetal-math-fp32-functions=" stringByAppendingString:functionsName]];
+ } else {
+  const BOOL fast=options?((BOOL (*)(id,SEL))objc_msgSend)(options,sel_registerName("fastMathEnabled")):YES;
+  [arguments addObject:fast?@"-ffast-math":@"-fno-fast-math"];
+ }
  if(options.preserveInvariance)[arguments addObject:@"-fpreserve-invariance"];
  if(options.optimizationLevel==MTLLibraryOptimizationLevelSize)[arguments addObject:@"-Os"];
  [options.preprocessorMacros enumerateKeysAndObjectsUsingBlock:^(NSString *name,NSObject *value,BOOL *) {
@@ -1415,7 +1440,7 @@ static uint64_t packedSwizzle(MTLTextureSwizzleChannels s) {
 static bool textureDescriptor(MTLTextureDescriptor *d,NmbTextureDescriptor *out) {
  if(!d)return false;
  *out={(uint64_t)d.textureType,(uint64_t)d.pixelFormat,d.width,d.height,d.depth,d.mipmapLevelCount,d.sampleCount,d.arrayLength,(uint64_t)d.usage,(uint64_t)d.resourceOptions,
-       textureRotation(d),textureFlag(d,"framebufferOnly"),textureFlag(d,"isDrawable"),packedSwizzle(d.swizzle)};
+       textureRotation(d),textureFlag(d,"framebufferOnly"),textureFlag(d,"isDrawable"),packedSwizzle(d.swizzle),(uint64_t)d.allowGPUOptimizedContents};
  if(singleSample() && out->samples>1) {
   out->samples=1;
   if(out->type==MTLTextureType2DMultisample)out->type=MTLTextureType2D;
@@ -1464,6 +1489,7 @@ static bool textureDescriptor(MTLTextureDescriptor *d,NmbTextureDescriptor *out)
 - (MTLCPUCacheMode)cpuCacheMode {return (MTLCPUCacheMode)((_descriptor.options&MTLResourceCPUCacheModeMask)>>MTLResourceCPUCacheModeShift);}
 - (BOOL)isFramebufferOnly {return _descriptor.framebuffer_only!=0;}
 - (BOOL)isDrawable {return _descriptor.is_drawable!=0;}
+- (BOOL)allowGPUOptimizedContents {return _descriptor.allow_gpu_optimized_contents!=0;}
 - (IOSurfaceRef)iosurface {return _surface;}
 - (NSUInteger)iosurfacePlane {return 0;}
 - (id<MTLBuffer>)buffer {return _surface?nil:(id<MTLBuffer>)_buffer;}
@@ -1668,7 +1694,46 @@ static void noteUnalignedTexture(MTLTextureDescriptor *d,NSUInteger offset,NSUIn
 @end
 @implementation NBFunctionConstant
 @end
+@interface NBFunctionAttribute : NSObject
+@property(nonatomic,copy) NSString *name;
+@property(nonatomic) NSUInteger attributeIndex;
+@property(nonatomic) MTLDataType attributeType;
+@property(nonatomic,getter=isActive) BOOL active;
+@property(nonatomic,getter=isPatchData) BOOL patchData;
+@property(nonatomic,getter=isPatchControlPointData) BOOL patchControlPointData;
+@end
+@implementation NBFunctionAttribute
+@end
+static void libraryAirBytes(NBLibrary *library,const void *bytes,size_t length) {
+ const uint8_t *file=(const uint8_t *)bytes;
+ library.bytes=file;library.length=length;
+ if(length<8 || memcmp(file,"\xca\xfe\xba\xbe",4))return;
+ auto word=[&](size_t at) {return ((uint32_t)file[at]<<24)|((uint32_t)file[at+1]<<16)|((uint32_t)file[at+2]<<8)|file[at+3];};
+ const uint32_t count=word(4);
+ if(count>(length-8)/20)return;
+ for(uint32_t i=0;i<count;i++) {
+  const size_t at=8+20*(size_t)i;if(at>length || length-at<20)return;
+  if(word(at)!=0x01000017)continue;
+  const size_t offset=word(at+8),size=word(at+12);
+  if(offset>length || size>length-offset)return;
+  library.bytes=file+offset;library.length=size;return;
+ }
+}
 @implementation NBFunction
+- (NSArray *)stageInputAttributes {
+ if(!_handle)return nil;
+ int32_t count=nmb_function_attribute_count(_handle);if(count<=0)return nil;
+ NSMutableArray *attributes=[NSMutableArray arrayWithCapacity:count];
+ for(int32_t i=0;i<count;i++) {
+  char name[1024];uint64_t facts[5]={};
+  size_t length=nmb_function_attribute_at(_handle,(uint32_t)i,name,sizeof name,facts);
+  if(!length || length>sizeof name)return nil;
+  NBFunctionAttribute *a=[NBFunctionAttribute new];a.name=@(name);a.attributeIndex=facts[0];a.attributeType=(MTLDataType)facts[1];
+  a.active=facts[2];a.patchData=facts[3];a.patchControlPointData=facts[4];[attributes addObject:a];
+ }
+ return attributes;
+}
+- (NSArray *)vertexAttributes {return self.functionType==MTLFunctionTypeVertex?[self stageInputAttributes]:nil;}
 - (NSDictionary<NSString *,MTLFunctionConstant *> *)functionConstantsDictionary {
  NSMutableDictionary *result=[NSMutableDictionary dictionary];
  if(!_handle)return result;
@@ -1746,6 +1811,20 @@ static std::string quartzCoreCallers();
 // no runtime handle: it is stitched from its bitcode (functionBitcode) and refused as a pipeline's own function.
 static NBFunction *ciKernelFunction(NBLibrary *library,NSString *name);
 static bool forEachLibraryEntry(NBLibrary *library,const std::function<bool(const std::string &,int)> &visit);
+static NSError *functionLookupError(NBLibrary *library, NSString *name, NSString *detail) {
+ const char *wanted = name.UTF8String;
+ bool found = false;
+ // Core Image can search several libraries for the same kernel. Keep a missing
+ // function distinguishable from a failure to specialize a function that exists.
+ if(wanted && forEachLibraryEntry(library,[&](const std::string &entry,int) {
+  found = entry == wanted;
+  return !found;
+ }) && !found) {
+  return [NSError errorWithDomain:MTLLibraryErrorDomain code:MTLLibraryErrorFunctionNotFound
+                         userInfo:@{NSLocalizedDescriptionKey:detail}];
+ }
+ return nbError(detail);
+}
 @implementation NBLibrary
 - (void)dealloc {DetailSpan timing(9,(uintptr_t)_handle);nmb_library_release(_handle);}
 - (id<MTLFunction>)newFunctionWithName:(NSString *)name constantValues:(MTLFunctionConstantValues *)values error:(NSError **)error {
@@ -1791,7 +1870,8 @@ static bool forEachLibraryEntry(NBLibrary *library,const std::function<bool(cons
  }
  if(!handle){
   noteProblem([NSString stringWithFormat:@"specialized function %@: %@",name,lastError()]);
-  if(error)*error=nbError([NSString stringWithFormat:@"specialized function: %@",lastError()]);return nil;
+  if(error)*error=functionLookupError(self,name,[NSString stringWithFormat:@"specialized function: %@",lastError()]);
+  return nil;
  }
  NBFunction *function=[NBFunction new];function.handle=handle;function.name=name;function.sourceName=name;function.functionType=(MTLFunctionType)nmb_function_type(handle);
  function.constantsText=text;function.library=self;function.constantValues=snapshot;if(error)*error=nil;return (id<MTLFunction>)function;
@@ -1805,7 +1885,10 @@ static bool forEachLibraryEntry(NBLibrary *library,const std::function<bool(cons
 - (id<MTLFunction>)newFunctionWithDescriptor:(MTLFunctionDescriptor *)d error:(NSError **)error {
  if(!d.name){if(error)*error=nbError(@"a function name is required");return nil;}
  NBFunction *function=(NBFunction *)(d.constantValues?[self newFunctionWithName:d.name constantValues:d.constantValues error:error]:[self newFunctionWithName:d.name]);
- if(!function){if(error && !d.constantValues)*error=nbError([NSString stringWithFormat:@"function %@: %@",d.name,lastError()]);return nil;}
+ if(!function){
+  if(error && !d.constantValues)*error=functionLookupError(self,d.name,[NSString stringWithFormat:@"function %@: %@",d.name,lastError()]);
+  return nil;
+ }
  if(d.specializedName) {
   if(function.handle && !nmb_function_set_specialized_name(function.handle,d.specializedName.UTF8String)) {
    if(error)*error=nbError(lastError());return nil;
@@ -1823,6 +1906,14 @@ static bool forEachLibraryEntry(NBLibrary *library,const std::function<bool(cons
  for(uint32_t i=0,n=nmb_library_function_count(_handle);i<n;i++) {
   char name[256];nmb_library_function_name(_handle,i,name,sizeof name);[names addObject:[NSString stringWithUTF8String:name]];
  }
+ return names;
+}
+- (NSArray<NSString *> *)nb_primeFunctionNames {
+ NSMutableArray<NSString *> *names=[NSMutableArray array];
+ if(!forEachLibraryEntry(self,[&](const std::string &entry,int type) {
+  if((type==0 || type==2) && !entry.empty())[names addObject:@(entry.c_str())];
+  return true;
+ }))return self.functionNames;
  return names;
 }
 // _MTLLibrary's externFunctionNames: the entries of external linkage (TYPE 5), an empty array for a library without any. iPadOS 27's Core
@@ -1855,6 +1946,7 @@ static bool forEachLibraryEntry(NBLibrary *library,const std::function<bool(cons
  NmbFunction *handle=name?nmb_function_new_zero_constants(_handle,name.UTF8String):nullptr;
  if(!handle)return nil;
  NBFunction *function=[NBFunction new];function.handle=handle;function.name=name;function.sourceName=name;function.functionType=(MTLFunctionType)nmb_function_type(handle);
+ function.library=self;
  return (id<MTLFunction>)function;
 }
 @end
@@ -2133,8 +2225,10 @@ static void dumpSurfacesOnce(NSSet *textures,NSSet *owners) {
 // NATIVE_METAL_DUMP_CB: the textures this command buffer wrote, met while it was encoded (dumpTargets), the render pass's attachments
 // waiting for their encoder (dumpPending), how many passes and kernels it encoded so far, and whether it is the plugin's own readback.
 @property(nonatomic,strong) NSMutableArray *dumpTargets,*dumpPending;
+@property(nonatomic,strong) NSMutableArray *dumpPassReads;
+@property(nonatomic) uint64_t dumpAppIndex;
 @property(nonatomic) uint32_t dumpPasses,dumpKernels;
-@property(nonatomic) BOOL dumpReadback;
+@property(nonatomic) BOOL dumpReadback,dumpCapture;
 @property(nonatomic,strong) NBTexture *wallpaperOutput;
 @property(nonatomic,strong) NSMutableArray<NSString *> *dumpLog;   // its passes and first draws, as encoded (NBEncoder dumpDraw:)
 - (void)refuse:(NSString *)what;
@@ -2192,9 +2286,18 @@ static std::pair<uint32_t,uint32_t> dumpRange() {
 static bool dumpMaybe(NBCommandBuffer *commandBuffer) {
  const auto range=dumpRange();
  if(!range.first || commandBuffer.dumpReadback)return false;
+ if(commandBuffer.dumpCapture)return true;
  const uint64_t next=gAppCommits.load()+1;
- return next+16>=range.first && next<(uint64_t)range.first+range.second;
+ const bool capture=next+16>=range.first && next<(uint64_t)range.first+range.second;
+ // Keep a selected buffer's complete encoding when other buffers commit before it.
+ if(capture)commandBuffer.dumpCapture=YES;
+ return capture;
 }
+static bool dumpAtPassEnd() {
+ static const bool enabled=getenv("NATIVE_METAL_DUMP_PASS")!=nullptr;
+ return enabled;
+}
+static void dumpPassSnapshot(NBCommandBuffer *commands,NSArray *targets);
 // A line of the command buffer's NATIVE_METAL_DUMP_CB log (its passes, first draws and their state), printed before its readback.
 // NATIVE_METAL_DUMP_ONLY=1: only the NATIVE_METAL_DUMP_IMAGE targets are read back and written, with no log, so a long range of
 // command buffers (a small texture over hundreds of frames) costs little.
@@ -2210,6 +2313,8 @@ static NSString *dumpWords(const uint8_t *p,size_t n) {
  static const size_t words=[]{const char *v=getenv("NATIVE_METAL_DUMP_WORDS");return v && atoi(v)>0?size_t(atoi(v)):size_t(16);}();
  NSMutableString *s=[NSMutableString string];
  for(size_t i=0;i<std::min<size_t>(n/4,words);i++){float f;memcpy(&f,p+4*i,4);[s appendFormat:@" %.4g",f];}
+ [s appendString:@" hex"];
+ for(size_t i=0;i<std::min<size_t>(n/4,words);i++){uint32_t v;memcpy(&v,p+4*i,4);[s appendFormat:@" %08x",v];}
  size_t zero=0,nan=0;const size_t all=std::min<size_t>(n/4,256);
  for(size_t i=0;i<all;i++){uint32_t w;memcpy(&w,p+4*i,4);float f;memcpy(&f,&w,4);zero+=!w;nan+=std::isnan(f);}
  [s appendFormat:@" (of %zu words %zu zero, %zu NaN)",all,zero,nan];
@@ -2233,7 +2338,7 @@ static bool dumpMatched(NSString *pipeline) {
 }
 static void dumpNote(NBCommandBuffer *commandBuffer,NSMutableArray *into,id texture,NSUInteger level,NSUInteger slice,NSString *where) {
  if(!texture || ![texture isKindOfClass:[NBTexture class]])return;
- for(NSDictionary *seen in commandBuffer.dumpTargets)
+ if(!dumpAtPassEnd())for(NSDictionary *seen in commandBuffer.dumpTargets)
   if(seen[@"texture"]==texture && [seen[@"level"] unsignedIntegerValue]==level && [seen[@"slice"] unsignedIntegerValue]==slice)return;
  for(NSDictionary *seen in commandBuffer.dumpPending)
   if(seen[@"texture"]==texture && [seen[@"level"] unsignedIntegerValue]==level && [seen[@"slice"] unsignedIntegerValue]==slice)return;
@@ -2587,12 +2692,15 @@ static char encodeRenderModeOf(id object) {
 - (void)texture:(id<MTLTexture>)texture index:(NSUInteger)index stage:(uint32_t)stage {
  if(texture && ![(id)texture isKindOfClass:[NBTexture class]]){[_commandBuffer refuse:@"foreign texture"];return;}
  if(gDrawStats)[self noteState:kDSTexture key:stage<<8|(uint32_t)index object:(__bridge const void *)texture value:0];
- if(texture && stage==0 && (texture.usage&MTLTextureUsageShaderWrite) && dumpMaybe(_commandBuffer)) {
+ static const bool captureInputs=getenv("NATIVE_METAL_DUMP_INPUTS")!=nullptr;
+ const bool captureInput=stage==2 && captureInputs;
+ if(texture && ((stage==0 && (texture.usage&MTLTextureUsageShaderWrite)) || captureInput) && dumpMaybe(_commandBuffer)) {
   if(!_dumpEntries)_dumpEntries=[NSMutableArray array];
   if(!_commandBuffer.dumpTargets)_commandBuffer.dumpTargets=[NSMutableArray array];
   const NSUInteger before=_commandBuffer.dumpTargets.count;
   dumpNote(_commandBuffer,_commandBuffer.dumpTargets,texture,0,0,
-           [NSString stringWithFormat:@"kernel %u texture %lu",_commandBuffer.dumpKernels,(unsigned long)index]);
+           captureInput?[NSString stringWithFormat:@"pass %u input texture %lu",_commandBuffer.dumpPasses,(unsigned long)index]:
+                        [NSString stringWithFormat:@"kernel %u texture %lu",_commandBuffer.dumpKernels,(unsigned long)index]);
   if(_commandBuffer.dumpTargets.count>before)[_dumpEntries addObject:_commandBuffer.dumpTargets.lastObject];
  }
  if(texture){[_commandBuffer own:texture];}
@@ -2718,6 +2826,7 @@ static char encodeRenderModeOf(id object) {
   _targetW=0;
  }
  [super endEncoding];
+ if(dumpAtPassEnd() && dumpMaybe(self.commandBuffer))dumpPassSnapshot(self.commandBuffer,self.dumpEntries);
 }
 - (void)setRenderPipelineState:(id<MTLRenderPipelineState>)state {
  if(![(id)state isKindOfClass:[NBRenderPipeline class]]){[self.commandBuffer refuse:@"foreign render pipeline"];return;}
@@ -3110,19 +3219,80 @@ static unsigned dumpTexel(uint32_t format,const uint8_t *p,float c[4],unsigned *
   default: return 0;
  }
 }
+static void dumpWrite(const char *format,...) {
+ va_list args;va_start(args,format);char *text=nullptr;
+ const int length=vasprintf(&text,format,args);va_end(args);
+ if(length<0 || !text)return;
+ fwrite(text,1,(size_t)length,stderr);
+ static const bool file=getenv("NATIVE_METAL_DUMP_FILE")!=nullptr;
+ if(file && !gCacheRoot.empty()) {
+  static std::mutex lock;
+  static int fd=-1;
+  static size_t written=0;
+  static bool stopped=false;
+  std::lock_guard<std::mutex> hold(lock);
+  if(!stopped) {
+   if(fd<0)fd=open((gCacheRoot+"/command-buffer.log").c_str(),O_WRONLY|O_CREAT|O_TRUNC|O_CLOEXEC|O_NOFOLLOW,0600);
+   constexpr size_t limit=2*1024*1024;
+   const char capped[]="native-metal dump capture limit reached\n";
+   const bool fits=(size_t)length<=limit-sizeof capped-written;
+   const char *data=fits?text:capped;
+   size_t left=fits?(size_t)length:sizeof capped-1;
+   while(fd>=0 && left) {
+    const ssize_t n=write(fd,data,left);
+    if(n<0 && errno==EINTR)continue;
+    if(n<=0){close(fd);fd=-1;stopped=true;break;}
+    written+=(size_t)n;data+=n;left-=(size_t)n;
+   }
+   if(!fits && fd>=0){close(fd);fd=-1;stopped=true;}
+  }
+ }
+ static const bool unified=[]{const char *value=getenv("NATIVE_METAL_DUMP_LOG");return value && !strcmp(value,"1");}();
+ if(unified) {
+  static std::atomic<uint64_t> sequence;
+  const uint64_t entry=sequence.fetch_add(1)+1;
+  const size_t parts=((size_t)length+511)/512;
+  for(size_t part=0;part<parts;++part) {
+   const size_t at=part*512;
+   std::string chunk(text+at,std::min<size_t>(512,(size_t)length-at));
+   os_log(OS_LOG_DEFAULT,"NativeAdrenoMetal CB dump %llu %zu/%zu: %{public}s",(unsigned long long)entry,part+1,parts,chunk.c_str());
+  }
+ }
+ free(text);
+}
+static void dumpShaderFunction(NBFunction *function) {
+ static NSArray<NSString *> *wanted=[]{
+  const char *value=getenv("NATIVE_METAL_DUMP_FUNCTIONS");
+  return value?[@(value) componentsSeparatedByString:@","]:@[];
+ }();
+ NSString *name=function.sourceName?:function.name;
+ bool selected=false;
+ for(NSString *prefix in wanted)if(prefix.length && ([prefix isEqualToString:@"all"] || [name containsString:prefix])){selected=true;break;}
+ if(!selected)return;
+ static std::mutex lock;static std::unordered_set<std::string> seen;static uint64_t sequence;
+ const std::string key=std::to_string((uintptr_t)function.library.bytes)+":"+(name.UTF8String?:"");
+ uint64_t entry;
+ {std::lock_guard<std::mutex> guard(lock);if(!seen.insert(key).second)return;entry=++sequence;}
+ NSData *data=functionBitcode(function);
+ if(!data.length || data.length>512*1024){dumpWrite("native-metal dump function %llu %s: unavailable (%lu bytes)\n",
+     (unsigned long long)entry,name.UTF8String,(unsigned long)data.length);return;}
+ NSString *encoded=[data base64EncodedStringWithOptions:0];
+ dumpWrite("native-metal dump function %llu %s: %s\n",(unsigned long long)entry,name.UTF8String,encoded.UTF8String);
+}
 static void dumpPrint(uint64_t appIndex,NSDictionary *read) {
  NSDictionary *t=read[@"target"];NBTexture *texture=t[@"texture"];const NmbTextureDescriptor d=texture.descriptor;
  NSString *encoder=t[@"encoder"];
  char head[400];
- snprintf(head,sizeof head,"native-metal dump cb %llu: %s%s%s%s texture %s %llux%llu f%llu L%lu S%lu",(unsigned long long)appIndex,
+ snprintf(head,sizeof head,"native-metal dump cb %llu: %s%s%s%s texture %s@%p %llux%llu f%llu L%lu S%lu",(unsigned long long)appIndex,
           [t[@"where"] UTF8String],encoder?" (":"",encoder?encoder.UTF8String:"",encoder?")":"",texture.label.length?texture.label.UTF8String:"-",
+          (__bridge void *)texture,
           (unsigned long long)d.width,(unsigned long long)d.height,(unsigned long long)d.format,
           (unsigned long)[t[@"level"] unsignedIntegerValue],(unsigned long)[t[@"slice"] unsignedIntegerValue]);
- if(read[@"skip"]){fprintf(stderr,"%s: %s\n",head,[read[@"skip"] UTF8String]);return;}
+ if(read[@"skip"]){dumpWrite("%s: %s\n",head,[read[@"skip"] UTF8String]);return;}
  const unsigned w=[read[@"w"] unsignedIntValue],rows=[read[@"rows"] unsignedIntValue],bpp=[read[@"bpp"] unsignedIntValue];
  const uint32_t format=[read[@"format"] unsignedIntValue];
  const uint8_t *bytes=(const uint8_t *)[(id<MTLBuffer>)read[@"buffer"] contents];
- if(!bytes){fprintf(stderr,"%s: no readback contents\n",head);return;}
+ if(!bytes){dumpWrite("%s: no readback contents\n",head);return;}
  double sum[4]={},lo[4]={INFINITY,INFINITY,INFINITY,INFINITY},hi[4]={-INFINITY,-INFINITY,-INFINITY,-INFINITY};
  uint64_t finite[4]={},nans=0,infs=0,black=0,texels=0;unsigned channels=1;
  double cell[8][32]={};uint32_t cellCount[8][32]={},cellNan[8][32]={},cellLit[8][32]={};
@@ -3148,21 +3318,21 @@ static void dumpPrint(uint64_t appIndex,NSDictionary *read) {
  }
  snprintf(part,sizeof part,"; nan %llu inf %llu black %.1f%% of %llu",(unsigned long long)nans,(unsigned long long)infs,
           texels?100.0*black/texels:0.0,(unsigned long long)texels);line+=part;
- fprintf(stderr,"%s\n",line.c_str());
+ dumpWrite("%s\n",line.c_str());
  for(unsigned gy=0;gy<8;gy++) {
   char grid[33]={};
   for(unsigned gx=0;gx<32;gx++) {
    const uint32_t n=cellCount[gy][gx];const double mean=n?cell[gy][gx]/n:0;
    grid[gx]=!n?' ':cellNan[gy][gx]?'!':!cellLit[gy][gx]?'.':mean>1?'+':mean<0?'-':(char)('0'+std::min(9,(int)(mean*10)));
   }
-  fprintf(stderr,"native-metal dump cb %llu:   |%s|\n",(unsigned long long)appIndex,grid);
+  dumpWrite("native-metal dump cb %llu:   |%s|\n",(unsigned long long)appIndex,grid);
  }
  // NATIVE_METAL_DUMP_IMAGE: the whole texture, its rows top down as the format stores them, in base64 lines of 6 KiB.
  if([read[@"image"] boolValue]) {
   NSString *text=[[NSData dataWithBytesNoCopy:(void *)bytes length:(NSUInteger)rows*w*bpp freeWhenDone:NO] base64EncodedStringWithOptions:0];
   const NSUInteger part=8192,parts=(text.length+part-1)/part;
   for(NSUInteger i=0;i<parts;i++)
-   fprintf(stderr,"native-metal dump image cb %llu: %s|%ux%u f%u bpp %u|%lu/%lu|%s\n",(unsigned long long)appIndex,[t[@"where"] UTF8String],w,rows,format,bpp,
+   dumpWrite("native-metal dump image cb %llu: %s|%ux%u f%u bpp %u|%lu/%lu|%s\n",(unsigned long long)appIndex,[t[@"where"] UTF8String],w,rows,format,bpp,
            (unsigned long)i+1,(unsigned long)parts,[text substringWithRange:NSMakeRange(i*part,std::min(part,text.length-i*part))].UTF8String);
  }
 }
@@ -3176,20 +3346,8 @@ static bool dumpImageWanted(NSString *where) {
  for(NSString *w in wanted)if(w.length && ([w isEqualToString:@"all"] || [where containsString:w]))return true;
  return false;
 }
-// The readback of `source`'s targets, by a command buffer of the plugin's own committed after it on its queue.
-static void dumpReadback(NBCommandBuffer *source,uint64_t appIndex) {
- NSArray *targets=[source.dumpTargets copy];
- if(dumpOnly())targets=[targets filteredArrayUsingPredicate:[NSPredicate predicateWithBlock:^BOOL(NSDictionary *t,NSDictionary *bindings){(void)bindings;
-  return dumpImageWanted(t[@"where"]);
- }]];
- else fprintf(stderr,"native-metal dump cb %llu: %lu targets, %u passes, %u kernels\n",(unsigned long long)appIndex,
-              (unsigned long)targets.count,source.dumpPasses,source.dumpKernels);
- for(NSString *line in source.dumpLog)fprintf(stderr,"native-metal dump cb %llu: %s\n",(unsigned long long)appIndex,line.UTF8String);
- if(!targets.count)return;
- NBCommandBuffer *readback=(NBCommandBuffer *)[(id<MTLCommandQueue>)source.queue commandBuffer];
- if(!readback)return;
- readback.dumpReadback=YES;
- id<MTLBlitCommandEncoder> blit=[(id<MTLCommandBuffer>)readback blitCommandEncoder];
+static NSArray *dumpEncodeReads(NBCommandBuffer *commands,NSArray *targets) {
+ id<MTLBlitCommandEncoder> blit=[(id<MTLCommandBuffer>)commands blitCommandEncoder];
  NSMutableArray *reads=[NSMutableArray array];
  for(NSDictionary *t in targets) {
   NBTexture *texture=t[@"texture"];const NmbTextureDescriptor d=texture.descriptor;
@@ -3197,7 +3355,8 @@ static void dumpReadback(NBCommandBuffer *source,uint64_t appIndex) {
   float c[4];unsigned channels=0;const uint8_t zero[16]={};
   const unsigned bpp=texture.pvrtc?0:dumpTexel((uint32_t)d.format,zero,c,&channels);
   NSString *skip=!bpp?@"format not read back":d.samples>1?@"multisampled":d.type==MTLTextureType3D?@"3D":
-                 texture.storageMode==MTLStorageModeMemoryless?@"memoryless":nil;
+                 texture.storageMode==MTLStorageModeMemoryless?@"memoryless":
+                 dumpAtPassEnd() && t[@"store"] && [t[@"store"] unsignedIntegerValue]==MTLStoreActionDontCare?@"store action DontCare":nil;
   if(skip){[reads addObject:@{@"target":t,@"skip":skip}];continue;}
   const NSUInteger w=std::max<NSUInteger>(1,(NSUInteger)d.width>>level),h=std::max<NSUInteger>(1,(NSUInteger)d.height>>level);
   const bool image=dumpImageWanted(t[@"where"]);
@@ -3211,8 +3370,33 @@ static void dumpReadback(NBCommandBuffer *source,uint64_t appIndex) {
   [reads addObject:@{@"target":t,@"buffer":buffer,@"w":@(w),@"rows":@(rows),@"bpp":@(bpp),@"format":@((uint32_t)d.format),@"image":@(image)}];
  }
  [blit endEncoding];
+ return reads;
+}
+// Snapshot a stored attachment immediately after its encoder, before heap reuse or a later pass can overwrite it.
+static void dumpPassSnapshot(NBCommandBuffer *commands,NSArray *targets) {
+ if(dumpOnly())targets=[targets filteredArrayUsingPredicate:[NSPredicate predicateWithBlock:^BOOL(NSDictionary *t,NSDictionary *bindings){(void)bindings;
+  return dumpImageWanted(t[@"where"]);
+ }]];
+ if(!targets.count)return;
+ if(!commands.dumpPassReads)commands.dumpPassReads=[NSMutableArray array];
+ [commands.dumpPassReads addObjectsFromArray:dumpEncodeReads(commands,targets)];
+}
+// The readback of `source`'s targets, by a command buffer of the plugin's own committed after it on its queue.
+static void dumpReadback(NBCommandBuffer *source,uint64_t appIndex) {
+ NSArray *targets=[source.dumpTargets copy];
+ if(dumpOnly())targets=[targets filteredArrayUsingPredicate:[NSPredicate predicateWithBlock:^BOOL(NSDictionary *t,NSDictionary *bindings){(void)bindings;
+  return dumpImageWanted(t[@"where"]);
+ }]];
+ else dumpWrite("native-metal dump cb %llu: %lu targets, %u passes, %u kernels%s\n",(unsigned long long)appIndex,
+              (unsigned long)targets.count,source.dumpPasses,source.dumpKernels,dumpAtPassEnd()?"; pass snapshots":"");
+ for(NSString *line in source.dumpLog)dumpWrite("native-metal dump cb %llu: %s\n",(unsigned long long)appIndex,line.UTF8String);
+ if(dumpAtPassEnd() || !targets.count)return;
+ NBCommandBuffer *readback=(NBCommandBuffer *)[(id<MTLCommandQueue>)source.queue commandBuffer];
+ if(!readback)return;
+ readback.dumpReadback=YES;
+ NSArray *reads=dumpEncodeReads(readback,targets);
  [(id<MTLCommandBuffer>)readback addCompletedHandler:^(id<MTLCommandBuffer> done) {
-  if(done.error){fprintf(stderr,"native-metal dump cb %llu: readback failed: %s\n",(unsigned long long)appIndex,
+  if(done.error){dumpWrite("native-metal dump cb %llu: readback failed: %s\n",(unsigned long long)appIndex,
                          done.error.localizedDescription.UTF8String);return;}
   for(NSDictionary *read in reads)dumpPrint(appIndex,read);
  }];
@@ -3266,6 +3450,8 @@ static char kUserDictionaryKey;
 - (void)setProtectionOptions:(uint64_t)options {if(options)[self refuse:[NSString stringWithFormat:@"protection options 0x%llx",options]];}
 - (void)refuse:(NSString *)what {
  if(!self.encodeFailure){self.encodeFailure=what;NBLOG(@"native-metal: command buffer refused: %@",what);}
+ // Recovery creates a new runtime device; launchd restarts a render server whose retained objects belong to the previous device.
+ if([what rangeOfString:@"MadeBeforeRecovery"].location!=NSNotFound)endRenderServerAfterGpuLoss();
 }
 - (MTLCommandBufferStatus)status {
  if(self.failedLocally)return MTLCommandBufferStatusError;
@@ -3341,9 +3527,11 @@ static char kUserDictionaryKey;
   _dumpPending=[NSMutableArray array];
   for(unsigned i=0;i<8;i++) {
    MTLRenderPassColorAttachmentDescriptor *c=d.colorAttachments[i];
+   const NSUInteger before=_dumpPending.count;
    if(c.resolveTexture)dumpNote(self,_dumpPending,c.resolveTexture,c.resolveLevel,c.resolveSlice,
                                 [NSString stringWithFormat:@"pass %u resolve %u",_dumpPasses,i]);
    else dumpNote(self,_dumpPending,c.texture,c.level,c.slice,[NSString stringWithFormat:@"pass %u color %u",_dumpPasses,i]);
+   if(_dumpPending.count>before)_dumpPending.lastObject[@"store"]=@(c.storeAction);
   }
   dumpNote(self,_dumpPending,d.depthAttachment.texture,d.depthAttachment.level,d.depthAttachment.slice,
            [NSString stringWithFormat:@"pass %u depth",_dumpPasses]);
@@ -3533,6 +3721,11 @@ static char kUserDictionaryKey;
  frontStage(traceNumber,self.commitIndex,8);
  const uint64_t flushed=flushSurfaces(_surfaces);
  frontStage(traceNumber,self.commitIndex,9,flushed,(uint32_t)_surfaces.count);
+ if(_dumpAppIndex) {
+  if(self.status==MTLCommandBufferStatusCompleted)for(NSDictionary *read in _dumpPassReads)dumpPrint(_dumpAppIndex,read);
+  else dumpWrite("native-metal dump cb %llu: pass snapshots failed: %s\n",(unsigned long long)_dumpAppIndex,self.error.localizedDescription.UTF8String?:"command refused");
+  _dumpPassReads=nil;
+ }
  if(freezeWallpaperOn() && !self.failedLocally && self.status==MTLCommandBufferStatusCompleted &&
     self.wallpaperOutput && encodedWork.draws) {
   std::lock_guard<std::recursive_mutex> guard(gWallpaperLock);
@@ -3634,13 +3827,15 @@ static char kUserDictionaryKey;
   // Completion owns this reference; the runtime orders the non-owning scheduled callback before it.
   void *context=(__bridge_retained void *)self;
   const uint64_t appIndex=self.dumpReadback?0:gAppCommits.fetch_add(1)+1;
+  const auto range=dumpRange();
+  const bool capture=appIndex && range.first && appIndex>=range.first && appIndex<(uint64_t)range.first+range.second;
+  if(capture && dumpAtPassEnd()){self.dumpAppIndex=appIndex;dumpReadback(self,appIndex);}
   frontStage(traceNumber,self.commitIndex,6);
   if(nmb_command_buffer_on_completed(_handle,completed,context) &&
      nmb_command_buffer_on_scheduled(_handle,scheduled,context) && nmb_command_buffer_commit(_handle)) {
    frontStage(traceNumber,self.commitIndex,7);
-   const auto range=dumpRange();
    self.submitted=YES;
-   if(appIndex && range.first && appIndex>=range.first && appIndex<(uint64_t)range.first+range.second)dumpReadback(self,appIndex);
+   if(capture && !dumpAtPassEnd())dumpReadback(self,appIndex);
    [self fireEarly];return;
   }
   (void)CFBridgingRelease(context);   // refused registration/commit cannot call the registered handlers
@@ -3977,6 +4172,14 @@ static bool renderDescriptor(MTLRenderPipelineDescriptor *d,NBRenderDescriptor *
 // NATIVE_METAL_DUMP_CB: a render pipeline's functions, color formats (b blends, m its write mask), depth format and vertex layout
 // (attribute=format@offset/buffer, layout=stride/step/rate), for its draws' lines.
 static NSString *renderDumpInfo(MTLRenderPipelineDescriptor *d) {
+ if(dumpRange().first) {
+  NBFunction *vertex=[(id)d.vertexFunction isKindOfClass:[NBFunction class]]?(NBFunction *)d.vertexFunction:nil;
+  NBFunction *fragment=[(id)d.fragmentFunction isKindOfClass:[NBFunction class]]?(NBFunction *)d.fragmentFunction:nil;
+  dumpWrite("native-metal dump pipeline %s | v %s source %s %s | f %s source %s %s\n",d.label.UTF8String?:"-",
+      vertex.name.UTF8String?:"-",vertex.sourceName.UTF8String?:"-",vertex?vertex.constantsText.c_str():"",
+      fragment.name.UTF8String?:"-",fragment.sourceName.UTF8String?:"-",fragment?fragment.constantsText.c_str():"");
+  if(vertex)dumpShaderFunction(vertex);if(fragment)dumpShaderFunction(fragment);
+ }
  NSMutableString *s=[NSMutableString stringWithFormat:@"%@ v=%@ f=%@",d.label?:@"-",d.vertexFunction.name?:@"-",d.fragmentFunction.name?:@"-"];
  for(unsigned i=0;i<8;i++) {
   MTLRenderPipelineColorAttachmentDescriptor *a=d.colorAttachments[i];if(a.pixelFormat==MTLPixelFormatInvalid)continue;
@@ -4338,10 +4541,11 @@ static char dvmMemoryReleaseKey;
   NSString *why=lastError();
   uint64_t answer[2]={0,0};
   (void)nmb_device_heap_texture_size_and_align(gDevice,&descriptor,answer);
-  GLOG(@"native-metal: heap texture refused: %@ | fmt %lu %lux%lu L%lu type %lu needs %#llx@%#llx heap %#lx used %#lx room %#lx",why,
+  GLOG(@"native-metal: heap texture refused: %@ | fmt %lu %lux%lu L%lu type %lu needs %#llx@%#llx heap %#lx used %#lx room %#lx usage %#lx options %#lx optimized %d descriptor %p",why,
         (unsigned long)d.pixelFormat,(unsigned long)d.width,(unsigned long)d.height,(unsigned long)d.mipmapLevelCount,
         (unsigned long)_heapType,(unsigned long long)answer[0],(unsigned long long)answer[1],(unsigned long)nmb_heap_size(_handle),
-        (unsigned long)nmb_heap_used_size(_handle),(unsigned long)nmb_heap_max_available_size(_handle,answer[1]?answer[1]:1));
+        (unsigned long)nmb_heap_used_size(_handle),(unsigned long)nmb_heap_max_available_size(_handle,answer[1]?answer[1]:1),
+        (unsigned long)d.usage,(unsigned long)d.resourceOptions,(int)d.allowGPUOptimizedContents,d);
   if(offset!=UINT64_MAX)return nil;
   handle=nmb_texture_new(gDevice,&descriptor);
   if(!handle){NBLOG(@"native-metal: texture (fmt %lu %lux%lu, %lu levels) refused: %@",(unsigned long)d.pixelFormat,(unsigned long)d.width,(unsigned long)d.height,(unsigned long)d.mipmapLevelCount,lastError());return nil;}
@@ -4550,6 +4754,13 @@ static void fillBaseLimits(id device);
  NmbTextureDescriptor descriptor;uint64_t answer[2]={0,0};
  if(textureDescriptor(d,&descriptor)&&!nmb_device_heap_texture_size_and_align(gDevice,&descriptor,answer))
   NBLOG(@"native-metal: heap texture size (fmt %lu %lux%lu, %lu levels) refused: %@",(unsigned long)d.pixelFormat,(unsigned long)d.width,(unsigned long)d.height,(unsigned long)d.mipmapLevelCount,lastError());
+ if(iconMetalTrace()) {
+  static std::atomic<unsigned> queries{0};
+  if(queries.fetch_add(1)<64)GLOG(@"native-metal: heap query fmt %lu %lux%lu L%lu usage %#lx options %#lx optimized %d -> %#llx@%#llx descriptor %p",
+      (unsigned long)d.pixelFormat,(unsigned long)d.width,(unsigned long)d.height,(unsigned long)d.mipmapLevelCount,
+      (unsigned long)d.usage,(unsigned long)d.resourceOptions,(int)d.allowGPUOptimizedContents,
+      (unsigned long long)answer[0],(unsigned long long)answer[1],d);
+ }
  return (MTLSizeAndAlign){answer[0],answer[1]};
 }
 - (MTLSizeAndAlign)heapBufferSizeAndAlignWithLength:(NSUInteger)length options:(MTLResourceOptions)options {
@@ -4657,7 +4868,7 @@ static void fillBaseLimits(id device);
  const uint64_t libraryBegan=nowUs();
  NmbLibrary *handle=nmb_library_new(gDevice,bytes,size,false);gTimeLibrary.add(libraryBegan);
  if(!handle)return failWith<id<MTLLibrary>>(error,@"library",nil);
- NBLibrary *library=[NBLibrary new];library.handle=handle;library.storage=mapped;library.bytes=(const uint8_t *)bytes;library.length=size;
+ NBLibrary *library=[NBLibrary new];library.handle=handle;library.storage=mapped;libraryAirBytes(library,bytes,size);
  if(error)*error=nil;return (id<MTLLibrary>)library;
 }
 // A library file that cannot be read (macOS run36: QuartzCore's default.metallib failed with NSCocoaErrorDomain 260 on a fresh Data
@@ -4682,7 +4893,7 @@ static void reportUnreadableLibrary(NSString *path) {
  const uint64_t libraryBegan=nowUs();
  NmbLibrary *handle=nmb_library_new(gDevice,bytes.bytes,bytes.length,false);gTimeLibrary.add(libraryBegan);
  if(!handle)return failWith<id<MTLLibrary>>(error,@"library",nil);
- NBLibrary *library=[NBLibrary new];library.handle=handle;library.storage=bytes;library.bytes=(const uint8_t *)bytes.bytes;library.length=bytes.length;
+ NBLibrary *library=[NBLibrary new];library.handle=handle;library.storage=bytes;libraryAirBytes(library,bytes.bytes,bytes.length);
  if(error)*error=nil;return (id<MTLLibrary>)library;
 }
 - (id<MTLLibrary>)newLibraryWithURL:(NSURL *)url error:(NSError **)error {
@@ -5275,6 +5486,15 @@ extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint
  gMissing=missing;gInFlight=[NSMutableSet set];
  if(cache && *cache){configureShaderDiskCache(cache);gCacheRoot=cache;}
  if(diagOn())nmb_message_hook(runtimeMessage);
+ const bool renderStderr=diagOn() && nativeIsRenderServer();
+ if(diagOn() && !gCacheRoot.empty() && (renderStderr || (getenv("NATIVE_METAL_DUMP_CB") && !strcmp(getprogname(),"iconservicesagent")))) {
+  const std::string path=gCacheRoot+"/runtime-stderr.log";
+  const int fd=open(path.c_str(),O_WRONLY|O_CREAT|(renderStderr?O_APPEND:O_TRUNC)|O_CLOEXEC|O_NOFOLLOW,0600);
+  if(fd>=0) {
+   dprintf(fd,"native-metal runtime stderr boot=%s pid=%d\n",getenv("NATIVE_METAL_BOOT_SESSION")?:"unknown",getpid());
+   if(fd!=STDERR_FILENO){dup2(fd,STDERR_FILENO);close(fd);}
+  }
+ }
  gDevice=nmb_device_open(loader,cache);
  if(loader)gLoaderPath=loader;
  if(gDevice && loader && !strcmp(getprogname(),"backboardd") && (getenv("NATIVE_METAL_TRANSIENT_GMEM") || getenv("NATIVE_METAL_TRANSIENT_SYSMEM_AB"))) {
@@ -5676,18 +5896,23 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
     row("V vkpipe n=%llu total=%llums max=%llums waited=%llums failed=%llu",(ull)work[0],ms(work[1]),ms(work[2]),ms(work[3]),(ull)work[4]);
    row("V cache hit%llu miss%llu wr%llu | msg i%llu w%llu",(ull)work[7],(ull)work[8],(ull)work[9],(ull)work[5],(ull)work[6]);
   }
-  // The shader cache's full counts (nmb_device_shader_cache_detail): functions found/translated, compute and render pipelines found/compiled, entries
+  // The shader cache's full counts (nmb_device_shader_cache_detail): functions found/translated, driver data found/unchanged, render pipelines found/compiled, entries
   // rejected, unreadable, handed to the directory (queued, written on the asking thread), bytes written, failed writes, evictions, the driver's own
   // pipeline cache: loads, saves, hits, misses.
   uint64_t sc[24]={};
   if(nmb_device_shader_cache_detail(gDevice,sc)) {
-   row("SC fn %llu/%llu cp %llu/%llu rp %llu/%llu rej %llu rd-fail %llu",(ull)sc[2],(ull)sc[3],(ull)sc[4],(ull)sc[5],(ull)sc[6],(ull)sc[7],
+   row("SC fn %llu/%llu data %llu/%llu rp %llu/%llu rej %llu rd-fail %llu",(ull)sc[2],(ull)sc[3],(ull)sc[4],(ull)sc[5],(ull)sc[6],(ull)sc[7],
     (ull)sc[8],(ull)sc[9]);
    row("SCb wr %llu q %llu thr %llu %lluK wfail %llu evict %llu qhit %llu | drv load %llu save %llu hit %llu miss %llu",(ull)sc[10],(ull)sc[11],
     (ull)sc[12],(ull)(sc[13]>>10),(ull)sc[15],(ull)sc[16],(ull)sc[14],(ull)sc[17],(ull)sc[20],(ull)sc[18],(ull)sc[19]);
+   row("SCc drv truncated %llu mismatched %llu",(ull)sc[21],(ull)sc[22]);
   }
  }
+#if !TARGET_OS_OSX
  row("PR compiling=%u libs=%u/%u made=%u rate=%u resumed=%u",native_prime_compiling,native_prime_libraries_done,native_prime_libraries_total,native_prime_made,native_prime_rate,native_prime_functions_resumed);
+ row("PRc state=%u failed=%u refused=%u bad=%u missing=%u",native_prime_pass_complete,native_prime_libraries_failed,
+  native_prime_functions_refused,native_prime_functions_skipped,native_prime_inventory_failed);
+#endif
  // Priming's reach and the system shader cache. PRb: the pass's scope (1 the bundles loaded here, 2 the whole system), the libraries
  // it compiled itself, those it leaves out (other GPUs' driver bundles, or not loaded here), the system cache's state here (0 not
  // named, 1 read, 2 filled by this process, 3 refused) and what this process published: the entries and KiB its cache directory
@@ -5697,12 +5922,24 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
   uint64_t sc[24]={},sy[4]={};
   if(gDevice)(void)nmb_device_shader_cache_detail(gDevice,sc);
   (void)nmb_system_cache_counts(sy);
+#if !TARGET_OS_OSX
   row("PRb scope=%u primed=%u left=%u | system %d pub %llu/%lluK",native_prime_scope,native_prime_libraries_primed,
    native_prime_libraries_skipped,gSystemCacheState,(ull)(gSystemCacheState==2?sc[11]+sc[12]:0),(ull)(gSystemCacheState==2?sc[13]>>10:0));
+#else
+  row("SY system %d pub %llu/%lluK",gSystemCacheState,(ull)(gSystemCacheState==2?sc[11]+sc[12]:0),(ull)(gSystemCacheState==2?sc[13]>>10:0));
+#endif
   if(gSystemCacheState==1 || gSystemCacheState==3)
    row("SY read %llu/%lluK rej %llu refused %llu replies %llu",(ull)sy[0],(ull)(sy[3]>>10),(ull)sy[1],(ull)sy[2],(ull)gCompileSystem.load());
  }
  if(gDevice) {
+  uint64_t fast[15]={};
+  if(nmb_device_fast_path_counts(gDevice,fast)) {
+   row("FP group %llu/%llu pools %llu/%llu linear %llu/%llu evict %llu",(ull)fast[0],(ull)fast[1],(ull)fast[2],(ull)fast[3],
+    (ull)fast[4],(ull)fast[5],(ull)fast[6]);
+   if(fast[9]==UINT64_MAX)row("CM calls %llu total %lluus",(ull)fast[7],(ull)fast[8]);
+   else row("CM calls %llu us %llu/%llu/%llu/%llu/%llu/%llu/%llu",(ull)fast[7],(ull)fast[8],(ull)fast[9],(ull)fast[10],(ull)fast[11],
+    (ull)fast[12],(ull)fast[13],(ull)fast[14]);
+  }
   // The warm pass (records warmed, failed, unread, KiB of driver data) and where work ran: scheduler passes and batches at commit, render
   // log waits, encoder ends on the lowering thread.
   uint64_t flow[8]={};
