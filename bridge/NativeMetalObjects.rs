@@ -9,7 +9,7 @@ use metal2vulkan::metal::state::{DepthStencilDescriptor, StencilDescriptor};
 use metal2vulkan::library::{FunctionConstantValue, FunctionConstantValues};
 use metal2vulkan::metal::{
     BlendFactor, BlendOperation, ColorWriteMask, CompareFunction, CullMode, DataType, IndexType, PixelFormat, PrimitiveTopologyClass,
-    PrimitiveType, RenderStages, SamplerAddressMode, SamplerBorderColor, SamplerMinMagFilter, SamplerMipFilter, StencilOperation, TextureType,
+    PrimitiveType, RenderStages, ResourceUsage, SamplerAddressMode, SamplerBorderColor, SamplerMinMagFilter, SamplerMipFilter, StencilOperation, TextureType,
     TessellationControlPointIndexType, TessellationFactorFormat, TessellationFactorStepFunction, TessellationPartitionMode, TextureUsage,
     TextureSwizzle, TextureSwizzleChannels, TriangleFillMode, VertexFormat, VertexStepFunction, Winding,
 };
@@ -18,7 +18,7 @@ use metal2vulkan::pipeline::{
     TessellationDescriptor, TileRenderPipelineDescriptor, VertexAttributeDescriptor, VertexBufferLayoutDescriptor, VertexDescriptor,
 };
 use metal2vulkan_runtime::{
-    BinaryArchive, BinaryArchiveDescriptor, BlitCommandEncoder, FamilyRow, FeatureRow, GpuFamily, RowState, BlitOption, Buffer, ClearColor, CommandBuffer, CommandQueue, ComputeCommandEncoder,
+    ArgumentEncoder, BinaryArchive, BinaryArchiveDescriptor, BlitCommandEncoder, FamilyRow, FeatureRow, GpuFamily, RowState, BlitOption, Buffer, ClearColor, CommandBuffer, CommandQueue, ComputeCommandEncoder,
     ComputePipelineState, Deallocator, DebugMessage, DepthStencilState, Device, DeviceOptions, MessageSeverity, MessageSink, Event, EventRef, Fence, Function, Heap, HeapDescriptor, HeapType, HostMemory, IoSurfacePlane, IoSurfaceYCbCr, Library, LoadAction,
     Origin, PipelineOption, PipelineOptions, PurgeableState, PrivateCount, PrivateFlag, PrivateProperties, MAX_COLOR_ATTACHMENTS, Region, RenderCommandEncoder, RenderPassDescriptor, RenderPipelineState, ResourceOptions,
     SamplerState, ScissorRect, SharedEvent, SharedEventListener, Size, StoreAction, Texture, TextureDescriptor, Viewport, VisibilityResultMode,
@@ -2029,6 +2029,93 @@ pub extern "C" fn nmb_function_release(function: *mut NmbFunction) {
     release(function)
 }
 
+pub struct NmbArgumentEncoder(ArgumentEncoder);
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_function_new_argument_encoder(function: *const NmbFunction, index: u64) -> *mut NmbArgumentEncoder {
+    guard(std::ptr::null_mut(), || {
+        let index = u32::try_from(index).map_err(e("argument buffer index"))?;
+        let encoder = get(function)?.0.new_argument_encoder_with_buffer_index(index).map_err(e("argument encoder"))?;
+        Ok(boxed(NmbArgumentEncoder(encoder)))
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_argument_encoder_release(encoder: *mut NmbArgumentEncoder) {
+    release(encoder);
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_argument_encoder_encoded_length(encoder: *const NmbArgumentEncoder) -> u64 {
+    guard(0, || Ok(get(encoder)?.0.encoded_length()))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_argument_encoder_alignment(encoder: *const NmbArgumentEncoder) -> u64 {
+    guard(0, || Ok(get(encoder)?.0.alignment()))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_argument_encoder_set_argument_buffer(encoder: *mut NmbArgumentEncoder, buffer: *const NmbBuffer, offset: u64) -> bool {
+    guard(false, || {
+        let buffer = optional(buffer)?;
+        let placed = buffer.map(|b| {
+            // Constant data pointers must remain valid like the buffer's contents pointer.
+            if b.1 {
+                b.0.pin();
+            }
+            b.0.live()
+        }).transpose()?;
+        get_mut(encoder)?.0.set_argument_buffer(placed.as_deref(), offset).map_err(e("set argument buffer"))?;
+        Ok(true)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_argument_encoder_set_buffer(encoder: *mut NmbArgumentEncoder, buffer: *const NmbBuffer, offset: u64, index: u64) -> bool {
+    guard(false, || {
+        let index = u32::try_from(index).map_err(e("argument index"))?;
+        let buffer = optional(buffer)?.map(|b| {
+            b.0.pin();
+            b.0.live()
+        }).transpose()?;
+        get(encoder)?.0.set_buffer(buffer.as_deref(), offset, index).map_err(e("encode buffer argument"))?;
+        Ok(true)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_argument_encoder_set_texture(encoder: *mut NmbArgumentEncoder, texture: *const NmbTexture, index: u64) -> bool {
+    guard(false, || {
+        let index = u32::try_from(index).map_err(e("argument index"))?;
+        let texture = optional(texture)?.map(|t| {
+            t.0.pin();
+            t.0.live()
+        }).transpose()?;
+        get(encoder)?.0.set_texture(texture.as_deref(), index).map_err(e("encode texture argument"))?;
+        Ok(true)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_argument_encoder_set_sampler(encoder: *mut NmbArgumentEncoder, sampler: *const NmbSampler, index: u64) -> bool {
+    guard(false, || {
+        let index = u32::try_from(index).map_err(e("argument index"))?;
+        let sampler = optional(sampler)?.map(|s| &s.0);
+        get(encoder)?.0.set_sampler_state(sampler, index).map_err(e("encode sampler argument"))?;
+        Ok(true)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_argument_encoder_constant_data(encoder: *const NmbArgumentEncoder, index: u64) -> *mut c_void {
+    guard(std::ptr::null_mut(), || {
+        let index = u32::try_from(index).map_err(e("argument index"))?;
+        let pointer = get(encoder)?.0.constant_data(index).map_err(e("constant argument"))?;
+        Ok(pointer.as_ptr().cast())
+    })
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn nmb_function_type(function: *const NmbFunction) -> u64 {
     guard(0, || Ok(get(function)?.0.function_type().map_err(e("function type"))?.as_raw() as u64))
@@ -2873,6 +2960,14 @@ pub extern "C" fn nmb_command_buffer_wait_scheduled(command_buffer: *mut NmbComm
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn nmb_command_buffer_require_kernel_submission(command_buffer: *mut NmbCommandBuffer) -> bool {
+    guard(false, || {
+        get(command_buffer)?.0.require_kernel_submission().map_err(e("native scanout submission"))?;
+        Ok(true)
+    })
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn nmb_command_buffer_commit(command_buffer: *mut NmbCommandBuffer) -> bool {
     let began = TIMING_LOG.get().map(|_| std::time::Instant::now());
     let result = guard(false, || {
@@ -3388,6 +3483,20 @@ pub extern "C" fn nmb_encoder_set_sampler(encoder: *mut NmbEncoder, stage: u32, 
 pub extern "C" fn nmb_compute_set_pipeline(encoder: *mut NmbEncoder, pipeline: *mut NmbComputePipeline) -> bool {
     guard(false, || {
         compute(encoder)?.set_compute_pipeline_state(&get(pipeline)?.0).map_err(e("compute pipeline"))?;
+        Ok(true)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_compute_use_resource(encoder: *mut NmbEncoder, buffer: *const NmbBuffer, texture: *const NmbTexture, usage: u64) -> bool {
+    guard(false, || {
+        let usage = raw::<ResourceUsage>(usage, "resource usage")?;
+        let encoder = compute(encoder)?;
+        match (optional(buffer)?, optional(texture)?) {
+            (Some(buffer), None) => encoder.use_resource(buffer.0.live()?.as_resource(), usage),
+            (None, Some(texture)) => encoder.use_resource(texture.0.live()?.as_resource(), usage),
+            _ => return Err("expected one indirect resource".into()),
+        }.map_err(e("use compute resource"))?;
         Ok(true)
     })
 }

@@ -1,0 +1,68 @@
+diff --git a/crates/metal2vulkan-runtime/src/command_buffer/group.rs b/crates/metal2vulkan-runtime/src/command_buffer/group.rs
+--- a/crates/metal2vulkan-runtime/src/command_buffer/group.rs
++++ b/crates/metal2vulkan-runtime/src/command_buffer/group.rs
+@@ -237,12 +237,32 @@
+     }
+ }
+
++impl CommandBuffer {
++    /// Keep the transition to Scheduled behind the final Vulkan submission.
++    /// A native scanout consumer takes its GPU fence snapshot at that transition.
++    pub fn require_kernel_submission(&self) -> Result<(), Error> {
++        let state = self.state();
++        if state.enqueued() || state.committing {
++            return Err(invalid("require_kernel_submission", Problem::AlreadyCommitted));
++        }
++        self.0.group_hold.fetch_or(KERNEL_SUBMISSION, Ordering::SeqCst);
++        Ok(())
++    }
++}
++
+ impl CommandBufferShared {
++    pub(super) fn requires_kernel_submission(&self) -> bool {
++        self.group_hold.load(Ordering::SeqCst) & KERNEL_SUBMISSION != 0
++    }
++
+     /// Whether its batches may wait in a group: every batch where its queue's batches group
+     /// ([`groups`]), and under `CompletionPolicy::Exact` those of a command buffer marked to join
+     /// the next where they merge ([`merges`], [`CommandBuffer::set_completion_joins_next`]); never
+     /// an unshared queue's on a `VkQueue` other queues' work is held back from (the module docs).
+     pub(crate) fn groups(&self) -> bool {
++        if self.requires_kernel_submission() {
++            return false;
++        }
+         let queue = self.queue.vk_queue();
+         let may = match self.joins_next() {
+             true => merges(&self.device, queue),
+@@ -258,6 +278,9 @@
+     /// in their kernel submission, seen complete at its own end
+     /// ([`CommandBuffer::set_completion_joins_next`]).
+     pub(crate) fn closes_groups(&self) -> bool {
++        if self.requires_kernel_submission() {
++            return false;
++        }
+         let queue = self.queue.vk_queue();
+         merges(&self.device, queue) && self.not_held_apart(queue)
+     }
+@@ -356,6 +379,9 @@
+ /// A command buffer's `group_hold` bit: it is marked to join the next
+ /// ([`CommandBuffer::set_completion_joins_next`]).
+ const JOINS_NEXT: u8 = 4;
++
++// A native consumer needs an issued GPU fence before it observes Scheduled.
++const KERNEL_SUBMISSION: u8 = 8;
+
+ /// Whether a batch of expected run `run` (nanoseconds; `None` where its queue has none yet) may
+ /// join batches whose expected runs sum to `held`: its run is known and the sum stays within
+diff --git a/crates/metal2vulkan-runtime/src/command_buffer/mod.rs b/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
+--- a/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
++++ b/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
+@@ -6929,7 +6929,7 @@
+     /// (`hang.rs`), a switch of storage forms rides on it, which settles by its last batch's
+     /// submission, or it fails already. Counted: `WorkCounts::scheduled_behind_host_steps`.
+     pub(crate) fn schedule_early(self: &Arc<Self>) -> Option<bool> {
+-        if hang::in_flight(&self.queue) || hang::holding(&self.queue) {
++        if self.requires_kernel_submission() || hang::in_flight(&self.queue) || hang::holding(&self.queue) {
+             return None;
+         }
+         let handlers = {

@@ -1679,6 +1679,9 @@ static void noteUnalignedTexture(MTLTextureDescriptor *d,NSUInteger offset,NSUIn
 - (id<MTLFunction>)nb_newFunctionWithName:(NSString *)name constantValues:(MTLFunctionConstantValues *)values zeroRest:(BOOL)zeroRest
                                     error:(NSError **)error;
 @end
+@interface NBArgumentEncoder : NBObject
+@property(nonatomic) NmbArgumentEncoder *handle;
+@end
 @interface NBFunction : NBObject
 @property(nonatomic) NmbFunction *handle;
 @property(nonatomic,copy) NSString *sourceName;
@@ -1723,6 +1726,13 @@ static void libraryAirBytes(NBLibrary *library,const void *bytes,size_t length) 
  }
 }
 @implementation NBFunction
+- (id<MTLArgumentEncoder>)newArgumentEncoderWithBufferIndex:(NSUInteger)index {
+ NmbArgumentEncoder *handle=nmb_function_new_argument_encoder(_handle,index);
+ if(!handle){NBLOG(@"native-metal: argument encoder refused: %@",lastError());return nil;}
+ NBArgumentEncoder *encoder=[NBArgumentEncoder new];
+ encoder.handle=handle;
+ return (id<MTLArgumentEncoder>)encoder;
+}
 - (NSArray *)stageInputAttributes {
  if(!_handle)return nil;
  int32_t count=nmb_function_attribute_count(_handle);if(count<=0)return nil;
@@ -2071,6 +2081,36 @@ static NBFunction *ciKernelFunction(NBLibrary *library,NSString *name) {
  }
 }
 @end
+@implementation NBArgumentEncoder
+- (void)dealloc {nmb_argument_encoder_release(_handle);}
+- (NSUInteger)encodedLength {return nmb_argument_encoder_encoded_length(_handle);}
+- (NSUInteger)alignment {return nmb_argument_encoder_alignment(_handle);}
+- (void)setArgumentBuffer:(id<MTLBuffer>)buffer offset:(NSUInteger)offset {
+ if(buffer && ![(id)buffer isKindOfClass:[NBBuffer class]]){NBLOG(@"native-metal: foreign argument buffer");return;}
+ if(!nmb_argument_encoder_set_argument_buffer(_handle,[(NBBuffer *)buffer handle],offset))
+  NBLOG(@"native-metal: setArgumentBuffer: %@",lastError());
+}
+- (void)setBuffer:(id<MTLBuffer>)buffer offset:(NSUInteger)offset atIndex:(NSUInteger)index {
+ if(buffer && ![(id)buffer isKindOfClass:[NBBuffer class]]){NBLOG(@"native-metal: foreign buffer argument");return;}
+ if(!nmb_argument_encoder_set_buffer(_handle,[(NBBuffer *)buffer handle],offset,index))
+  NBLOG(@"native-metal: encode buffer argument: %@",lastError());
+}
+- (void)setTexture:(id<MTLTexture>)texture atIndex:(NSUInteger)index {
+ if(texture && ![(id)texture isKindOfClass:[NBTexture class]]){NBLOG(@"native-metal: foreign texture argument");return;}
+ if(!nmb_argument_encoder_set_texture(_handle,[(NBTexture *)texture handle],index))
+  NBLOG(@"native-metal: encode texture argument: %@",lastError());
+}
+- (void)setSamplerState:(id<MTLSamplerState>)sampler atIndex:(NSUInteger)index {
+ if(sampler && ![(id)sampler isKindOfClass:[NBSampler class]]){NBLOG(@"native-metal: foreign sampler argument");return;}
+ if(!nmb_argument_encoder_set_sampler(_handle,[(NBSampler *)sampler handle],index))
+  NBLOG(@"native-metal: encode sampler argument: %@",lastError());
+}
+- (void *)constantDataAtIndex:(NSUInteger)index {
+ void *data=nmb_argument_encoder_constant_data(_handle,index);
+ if(!data)NBLOG(@"native-metal: constantDataAtIndex: %@",lastError());
+ return data;
+}
+@end
 @interface NBDepthStencil : NBObject
 @property(nonatomic) NmbDepthStencil *handle;
 @property(nonatomic,copy) NSString *dumpInfo;   // NATIVE_METAL_DUMP_CB: its depth test and write
@@ -2202,6 +2242,7 @@ static void dumpSurfacesOnce(NSSet *textures,NSSet *owners) {
  uint64_t traceNumber;
  uint32_t createCpu,createTid,commitCpu,commitTid;
  BOOL earlyEligible;   // made by the render server's thread: its completed handlers may run at submission (see fireEarly)
+ BOOL writesDpFramebuffer;
  std::vector<WatchedSource> watched;
 }
 @property(nonatomic) NmbCommandBuffer *handle;
@@ -2219,6 +2260,7 @@ static void dumpSurfacesOnce(NSSet *textures,NSSet *owners) {
 // Adds a resource a command names to resourceOwners, and holds it against a discard until the command buffer completed or went
 // (purgeHold:). Called on the thread that makes the call, before the command reaches the runtime.
 - (void)own:(id)resource;
+- (void)noteDpFramebufferWrite:(NBTexture *)texture;
 // The sampled sources watched for a rewrite while the GPU could read them (gWatchSources), kept alive until completion.
 @property(nonatomic,strong) NSMutableSet *sampled;
 - (void)watchTexture:(NBTexture *)texture;
@@ -2790,7 +2832,18 @@ static char encodeRenderModeOf(id object) {
  const std::array<uint64_t,3> g={group.width,group.height,group.depth};
  ENCODE([self check:nmb_compute_dispatch_indirect(self.handle,[(NBBuffer *)buffer handle],offset,g.data()) what:"indirect dispatch"]);
 }
-- (void)useResource:(id<MTLResource>)r usage:(MTLResourceUsage)u {(void)r;(void)u;}
+- (void)useResource:(id<MTLResource>)resource usage:(MTLResourceUsage)usage {
+ if([(id)resource isKindOfClass:[NBTexture class]]) {
+  NBTexture *texture=(NBTexture *)resource;
+  [self.commandBuffer own:texture];
+  if(texture.surface)[self.commandBuffer.surfaces addObject:texture];
+  ENCODE([self check:nmb_compute_use_resource(self.handle,nullptr,texture.handle,usage) what:"useResource"]);
+ } else if([(id)resource isKindOfClass:[NBBuffer class]]) {
+  NBBuffer *buffer=(NBBuffer *)resource;
+  [self.commandBuffer own:buffer];
+  ENCODE([self check:nmb_compute_use_resource(self.handle,buffer.handle,nullptr,usage) what:"useResource"]);
+ }
+}
 - (void)memoryBarrierWithScope:(MTLBarrierScope)s {(void)s;}
 @end
 
@@ -3100,6 +3153,7 @@ static char encodeRenderModeOf(id object) {
 - (void)copyFromTexture:(id<MTLTexture>)s sourceSlice:(NSUInteger)ss sourceLevel:(NSUInteger)sl sourceOrigin:(MTLOrigin)so sourceSize:(MTLSize)z
               toTexture:(id<MTLTexture>)d destinationSlice:(NSUInteger)ds destinationLevel:(NSUInteger)dl destinationOrigin:(MTLOrigin)dO {
  if(![self textures:NB_OBJECTS(s,d) count:2])return;
+ [self.commandBuffer noteDpFramebufferWrite:(NBTexture *)d];
  const std::array<uint64_t,3> a={so.x,so.y,so.z},size={z.width,z.height,z.depth},b={dO.x,dO.y,dO.z};
  ENCODE([self check:nmb_blit_copy_texture(self.handle,[(NBTexture *)s handle],ss,sl,a.data(),size.data(),[(NBTexture *)d handle],ds,dl,b.data())
                 what:"copyFromTexture:toTexture:"]);
@@ -3130,6 +3184,7 @@ static char encodeRenderModeOf(id object) {
             sourceSize:(MTLSize)z toTexture:(id<MTLTexture>)d destinationSlice:(NSUInteger)slice destinationLevel:(NSUInteger)level
      destinationOrigin:(MTLOrigin)dO {
  if(![self buffers:NB_OBJECTS(s) count:1] || ![self textures:NB_OBJECTS(d) count:1])return;
+ [self.commandBuffer noteDpFramebufferWrite:(NBTexture *)d];
  if(gLogTextures && textureLogTurn()) {
   const NmbTextureDescriptor t=[(NBTexture *)d descriptor];
   GLOG(@"native-metal: texture-log %llu bufferToTexture size %lux%lu origin %lu,%lu level %lu slice %lu | rows %lu image %lu offset %lu "
@@ -3489,6 +3544,12 @@ static char kUserDictionaryKey;
 - (CFTimeInterval)kernelStartTime {return 0;}
 - (CFTimeInterval)kernelEndTime {return 0;}
 - (BOOL)commitAndWaitUntilSubmitted {[(id<MTLCommandBuffer>)self commit];[self waitUntilScheduled];return !self.failedLocally;}
+- (void)noteDpFramebufferWrite:(NBTexture *)texture {
+ static const bool enabled=getenv("NATIVE_METAL_DP_SCANOUT")!=nullptr;
+ IOSurfaceRef surface=texture.surface;
+ if(enabled && surface && IOSurfaceGetPixelFormat(surface)==0x62336138)
+  writesDpFramebuffer=YES;
+}
 - (CFTimeInterval)GPUStartTime {return self.submitted && !self.failedLocally?nmb_command_buffer_gpu_time(_handle,false):0;}
 - (CFTimeInterval)GPUEndTime {return self.submitted && !self.failedLocally?nmb_command_buffer_gpu_time(_handle,true):0;}
 // An encoder whose runtime half `make` makes, on the encoding thread when that is on. A refused encoder is still an object: its calls
@@ -3569,6 +3630,7 @@ static char kUserDictionaryKey;
   if(!a.texture)return true;
   if(![(id)a.texture isKindOfClass:[NBTexture class]])return false;
   NBTexture *texture=(NBTexture *)a.texture;if(texture.surface)[_surfaces addObject:texture];
+  [self noteDpFramebufferWrite:texture];
   [self own:texture];
   const size_t copiesBefore=resolveCopies.size();
   out.texture=texture.handle;out.level=a.level;out.slice=a.slice;out.depth_plane=a.depthPlane;out.load=a.loadAction;out.store=a.storeAction;
@@ -3576,6 +3638,7 @@ static char kUserDictionaryKey;
    if(![(id)a.resolveTexture isKindOfClass:[NBTexture class]])return false;
    NBTexture *resolve=(NBTexture *)a.resolveTexture;
    [self own:resolve];if(resolve.surface)[_surfaces addObject:resolve];
+   [self noteDpFramebufferWrite:resolve];
    const bool resolves=a.storeAction==MTLStoreActionMultisampleResolve || a.storeAction==MTLStoreActionStoreAndMultisampleResolve;
    if(singleSample()) {
     if(resolves) {
@@ -3821,6 +3884,10 @@ static char kUserDictionaryKey;
   }
   ++gWallpaperAllowed;
  }
+ // The external framebuffer snapshots the Adreno fence after QuartzCore's
+ // submitted callback. Keep its XR10 writes out of deferred submission.
+ if(writesDpFramebuffer && !self.encodeFailure && !nmb_command_buffer_require_kernel_submission(_handle))
+  [self refuse:[@"native DP framebuffer submission: " stringByAppendingString:lastError()]];
  if(!self.encodeFailure) {
   frontStage(traceNumber,self.commitIndex,4);
   const uint64_t flushed=flushSurfaces(_surfaces);

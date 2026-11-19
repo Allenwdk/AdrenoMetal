@@ -17,6 +17,7 @@ typedef struct NmbHeap NmbHeap;
 typedef struct NmbTexture NmbTexture;
 typedef struct NmbLibrary NmbLibrary;
 typedef struct NmbFunction NmbFunction;
+typedef struct NmbArgumentEncoder NmbArgumentEncoder;
 typedef struct NmbComputePipeline NmbComputePipeline;
 typedef struct NmbRenderPipeline NmbRenderPipeline;
 typedef struct NmbSampler NmbSampler;
@@ -235,6 +236,16 @@ uint64_t nmb_function_type(const NmbFunction *);
 uint64_t nmb_function_patch_type(const NmbFunction *);              /* MTLPatchType */
 int64_t nmb_function_patch_control_point_count(const NmbFunction *); /* -1: no patch, or no count stated */
 
+NmbArgumentEncoder *nmb_function_new_argument_encoder(const NmbFunction *, uint64_t buffer_index);
+void nmb_argument_encoder_release(NmbArgumentEncoder *);
+uint64_t nmb_argument_encoder_encoded_length(const NmbArgumentEncoder *);
+uint64_t nmb_argument_encoder_alignment(const NmbArgumentEncoder *);
+bool nmb_argument_encoder_set_argument_buffer(NmbArgumentEncoder *, const NmbBuffer *, uint64_t offset);
+bool nmb_argument_encoder_set_buffer(NmbArgumentEncoder *, const NmbBuffer *, uint64_t offset, uint64_t index);
+bool nmb_argument_encoder_set_texture(NmbArgumentEncoder *, const NmbTexture *, uint64_t index);
+bool nmb_argument_encoder_set_sampler(NmbArgumentEncoder *, const NmbSampler *, uint64_t index);
+void *nmb_argument_encoder_constant_data(const NmbArgumentEncoder *, uint64_t index);
+
 NmbComputePipeline *nmb_compute_pipeline_new(NmbDevice *, NmbFunction *);
 void nmb_compute_pipeline_release(NmbComputePipeline *);
 uint64_t nmb_compute_pipeline_max_threads(const NmbComputePipeline *);
@@ -319,6 +330,8 @@ bool nmb_command_buffer_on_completed(NmbCommandBuffer *, void (*handler)(void *c
 /* Runs on actual scheduling, before completion. Not called if submission fails before scheduling.
  * The caller keeps context alive until completion (or a refused commit). */
 bool nmb_command_buffer_on_scheduled(NmbCommandBuffer *, void (*handler)(void *context), void *context);
+/* Native scanout takes a kernel fence when scheduling is reported. */
+bool nmb_command_buffer_require_kernel_submission(NmbCommandBuffer *);
 bool nmb_command_buffer_commit(NmbCommandBuffer *);
 /* Wait for scheduling and scheduled handlers only; false on a refused wait. */
 bool nmb_command_buffer_wait_scheduled(NmbCommandBuffer *);
@@ -373,6 +386,8 @@ bool nmb_encoder_set_buffer_offset(NmbEncoder *, uint32_t stage, uint64_t offset
 bool nmb_encoder_set_bytes(NmbEncoder *, uint32_t stage, const void *bytes, size_t length, uint32_t index);
 bool nmb_encoder_set_texture(NmbEncoder *, uint32_t stage, NmbTexture *, uint32_t index);
 bool nmb_encoder_set_sampler(NmbEncoder *, uint32_t stage, NmbSampler *, uint32_t index);
+/* Exactly one of buffer and texture is present. */
+bool nmb_compute_use_resource(NmbEncoder *, const NmbBuffer *buffer, const NmbTexture *texture, uint64_t usage);
 // The tile stage of a render encoder is stage 3 of the nmb_encoder_set_* binders. A tile pipeline is a render pipeline state made
 // from a tile descriptor (newRenderPipelineStateWithTileDescriptor:): formats are MTLPixelFormat values, 0 for no attachment.
 typedef struct {
