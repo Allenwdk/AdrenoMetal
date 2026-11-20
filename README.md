@@ -122,6 +122,8 @@ On release `2026-11-03-ipados27-gpu-coreimage-resources` (kernel CRC `90B6BC7012
 
 Drains register the queued prefix they need. Batch completion broadcasts only for newly completed targets; later enqueues do not delay earlier drains. Prefix storage retains capacity, same-prefix waiters share a notification, and work notifications occur only on empty-to-nonempty transitions. Batch trace phase4 marks an eligible-prefix notification. FIFO, scheduled/completed callbacks and ownership retain their original conditions. Host checks and formal image assembly pass; uke hardware latency remains pending.
 
+On Uke with `panel-sync=2`, the render frontend can hand off the first 3200×2136 BGRA panel render encoder in a command buffer while CoreAnimation records its draws. It splits that batch only if all previously handed-off work is complete. Frame trace type 15, stages 15 and 16 record creation of the first panel encoder. Stage 17 records the early handoff's batch number, or zero when the regular batching policy handles it. `panel-encode-early=0` restores the standard batch boundaries.
+
 With `sheng-diag=2 sheng-gpu-trace=2`, the current candidate alternates explicit GMEM and SYSMEM requests for large single-sample BGRA IOSurface passes whose extra color attachments are disposable memoryless targets. It records the request alongside command summaries. The scope resets after every encoder operation. SYSMEM allocates backing for those targets. Pixel correctness and performance await hardware comparison.
 
 ## Uke pass-timing repair

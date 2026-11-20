@@ -386,6 +386,12 @@ static id deviceForPort(unsigned port) {
         if (!strcmp(getprogname(), "backboardd") && bootArgSet("panel-sync=2"))
             setenv("NATIVE_METAL_EXACT_SCANOUT", "1", 1);
         else unsetenv("NATIVE_METAL_EXACT_SCANOUT");
+        if (getenv("NATIVE_METAL_EXACT_SCANOUT") && !bootArgSet("panel-encode-early=0"))
+            setenv("NATIVE_METAL_PANEL_ENCODE_EARLY", "1", 1);
+        else unsetenv("NATIVE_METAL_PANEL_ENCODE_EARLY");
+        if (getenv("NATIVE_METAL_EXACT_SCANOUT") && !bootArgSet("panel-gmem-scissor=0"))
+            setenv("NATIVE_METAL_PANEL_GMEM_SCISSOR", "1", 1);
+        else unsetenv("NATIVE_METAL_PANEL_GMEM_SCISSOR");
 #endif
         // The bridge's work placement (metal-flow=<bits>, read below). Any value logs the FL counts
         // (native_bridge_metal_open), so two runs compare without diag=1's own cost.
@@ -413,6 +419,15 @@ static id deviceForPort(unsigned port) {
                 }
             if (flow[0]) setenv("NATIVE_METAL_FLOW", flow, 1);
             else unsetenv("NATIVE_METAL_FLOW");
+#if TARGET_OS_IPHONE && defined(__arm64e__)
+            // For the panel-only candidate, the runtime's lowering worker
+            // supplies the async encoding stage on its own.
+            const bool loweringWorker = !flow[0] || (strtoul(flow, nullptr, 10) & 1);
+            if (loweringWorker && getenv("NATIVE_METAL_EXACT_SCANOUT") &&
+                bootArgSet("uke-dp-desktop=0") && !bootArgSet("panel-inline-encode=0"))
+                setenv("NATIVE_METAL_PANEL_INLINE_ENCODE", "1", 1);
+            else unsetenv("NATIVE_METAL_PANEL_INLINE_ENCODE");
+#endif
         }
         if (bootArgSet("wallpaper-freeze=1")) setenv("NATIVE_METAL_FREEZE_WALLPAPER", "1", 1);
         // log-gpu=1: the GPU stack's log lines (NSLog, the pipeline journal); off without it.

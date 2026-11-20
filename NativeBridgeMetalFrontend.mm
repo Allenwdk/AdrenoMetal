@@ -325,13 +325,13 @@ static void detailDefinition(uint64_t key,const char *label) {
  }
 }
 static void detailPoint(uint64_t id,uint32_t kind,uint32_t phase,uint64_t command,uint64_t object,uint64_t function,
-                        uint64_t began,uint64_t parent,uint64_t queued,uint32_t line=0,uint64_t ended=0) {
+                        uint64_t began,uint64_t parent,uint64_t queued,uint32_t line=0,uint64_t ended=0,bool emitLink=true) {
  const uint64_t now=ended?ended:nowUs();
  uint64_t tid=0;pthread_threadid_np(nullptr,&tid);
  TraceRec rec{};rec.type=17;rec.t0=now;rec.t1=id;rec.t2=command;rec.t3=object;
  rec.a=kind|(phase<<16);rec.b=(uint32_t)tid;rec.c=(uint32_t)function;rec.d=(uint32_t)(function>>32);
  rec.cpu0=(uint32_t)(began?now-began:0);rec.cpu1=line;tracePush(rec);
- if(phase!=1) {
+ if(phase!=1 && emitLink) {
   TraceRec link{};link.type=18;link.t0=now;link.t1=id;link.t2=parent;link.t3=queued;
   link.a=(uint32_t)began;link.b=(uint32_t)(began>>32);tracePush(link);
  }
@@ -441,11 +441,12 @@ static void traceStartWriter() {
   mkdir("/private/var/tmp/NativeAdrenoMetal.trace",0755);
   uint32_t written=0;
   uint64_t dropped=0,fileBytes=0,syncedBytes=0,lastSyncUs=0;
-  struct PassRec {uint64_t ns;uint32_t seq;uint16_t width,height;uint8_t mode,colors,flags,swap;uint16_t draws,format;uint32_t kpx;uint64_t gpuBegin,gpuEnd;uint16_t fsInstrs,fsTex,fsSy,fsSs;int8_t fsWaves,fsRegs;uint8_t samples,ds;uint32_t bandwidth,verts,fsHash;};
+  struct PassRec {uint64_t ns;uint32_t seq;uint16_t width,height;uint8_t mode,colors,flags,swap;uint16_t draws,format;uint32_t kpx,tileCounts;uint64_t gpuBegin,gpuEnd;uint16_t fsInstrs,fsTex,fsSy,fsSs;int8_t fsWaves,fsRegs;uint8_t samples,ds;uint32_t bandwidth,verts,fsHash;};
   struct SubRec {uint64_t ns;uint32_t seq,fence,syncWaitUs,callUs,spaceWaitUs;uint16_t busy;uint8_t chunks,buffers;};
   static_assert(sizeof(PassRec)==72 && sizeof(SubRec)==32,"turnip ring records");
   uint32_t passFrom=0,subFrom=0;
   void *turnip=nullptr;
+  unsigned panelTileStats=0;
   uint32_t (*passRead)(uint32_t,PassRec *,uint32_t,uint32_t *)=nullptr;
   uint32_t (*subRead)(uint32_t,SubRec *,uint32_t,uint32_t *)=nullptr;
   void (*copyStats)(uint64_t *)=nullptr;
@@ -462,6 +463,8 @@ static void traceStartWriter() {
     turnip=dlopen(gLoaderPath.c_str(),RTLD_NOW|RTLD_NOLOAD);
     if(turnip) {
      passRead=(uint32_t (*)(uint32_t,PassRec *,uint32_t,uint32_t *))dlsym(turnip,"tu_pass_ring_read");
+     if(auto version=(unsigned (*)())dlsym(turnip,"tu_panel_tile_stats_version"))
+      panelTileStats=version();
      if(diagOn()) {
       subRead=(uint32_t (*)(uint32_t,SubRec *,uint32_t,uint32_t *))dlsym(turnip,"tu_darwin_submit_ring_read");
       copyStats=(void (*)(uint64_t *))dlsym(turnip,"tu_copy_row_stats");
@@ -490,6 +493,10 @@ static void traceStartWriter() {
        detail.c=(uint8_t)p.fsWaves|(uint32_t)(uint8_t)p.fsRegs<<8|(uint32_t)p.samples<<16|(uint32_t)p.ds<<24;
        detail.d=p.bandwidth;detail.tid=p.verts;
        detail.cpu0=p.fsHash;   // the heaviest fragment shader's tu_hash32, joined to the pipeline log's names
+       if(panelTileStats>=2) {
+        detail.cpu1=(p.tileCounts&4095)|((p.tileCounts>>12&4095)<<16);
+        detail.tid2=p.tileCounts>>24;
+       } else if(panelTileStats==1)detail.cpu1=p.tileCounts;
        tracePush(detail);
       }
       passFrom=p.seq+1;
@@ -1185,6 +1192,8 @@ static void waitForResource(id resource);
 @property(nonatomic) NmbTextureDescriptor descriptor;
 @property(nonatomic,strong) NBBuffer *buffer;
 @property(nonatomic) IOSurfaceRef surface;
+@property(nonatomic,readonly) uint32_t surfaceID,surfaceFormat;
+@property(nonatomic,readonly) size_t surfaceWidth,surfaceHeight;
 @property(nonatomic) NSUInteger offset,rowBytes;
 @property(nonatomic,strong) id<MTLTexture> parent;
 @property(nonatomic,strong) id<MTLHeap> parentHeap;
@@ -1479,6 +1488,15 @@ static bool textureDescriptor(MTLTextureDescriptor *d,NmbTextureDescriptor *out)
 }
 @implementation NBTexture {
  uint8_t _purgeCounted;   // as NBBuffer's
+ IOSurfaceRef _surface;
+}
+@synthesize surface=_surface;
+- (void)setSurface:(IOSurfaceRef)surface {
+ _surface=surface;
+ _surfaceID=surface?IOSurfaceGetID(surface):0;
+ _surfaceFormat=surface?IOSurfaceGetPixelFormat(surface):0;
+ _surfaceWidth=surface?IOSurfaceGetWidth(surface):0;
+ _surfaceHeight=surface?IOSurfaceGetHeight(surface):0;
 }
 - (BOOL)purgeHold:(BOOL)hold {if(hold)return nmb_texture_hold(_handle);nmb_texture_unhold(_handle);return NO;}
 - (NSUInteger)allocatedSize {return nmb_texture_allocated_size(_handle);}
@@ -2262,6 +2280,7 @@ static void dumpSurfacesOnce(NSSet *textures,NSSet *owners) {
  BOOL earlyEligible;   // made by the render server's thread: its completed handlers may run at submission (see fireEarly)
  BOOL writesDpFramebuffer;
  BOOL writesPanelFramebuffer;
+ BOOL triedEarlyPanelEncode;
  BOOL ambiguousScanoutWrites;
  uint64_t scanoutRuntime;
  struct ScanoutTraceSurface {uint32_t id=0,format=0,width=0,height=0;};
@@ -2423,6 +2442,11 @@ static void dumpNote(NBCommandBuffer *commandBuffer,NSMutableArray *into,id text
 // no-encode-thread none.
 static const bool gEncodeThread=access("/private/var/ngpu/debug/no-encode-thread",F_OK)!=0 &&
                                 (isRenderServer() || access("/private/var/ngpu/debug/encode-thread",F_OK)==0);
+static bool panelInlineEncode() {
+ static const bool enabled=getenv("NATIVE_METAL_PANEL_INLINE_ENCODE")!=nullptr;
+ return enabled;
+}
+static bool useEncodeThread() {return gEncodeThread && !panelInlineEncode();}
 // One thread of its own runs the work, in batches a calling thread hands over at 64 calls, at an encoder's end, at a commit and before a
 // wait: a dispatch queue took a call at a time and woke one of the pool's threads for each, a cost above a cheap call's own (GFXBench's
 // Driver Overhead 2 drew 16% fewer frames on 60% more CPU a frame), and spread the work over half a dozen threads.
@@ -2533,11 +2557,12 @@ static EncodeThread &encodeThread() {
  return *thread;
 }
 static bool onEncodeQueue() {return tOnEncodeThread;}
-static void encodeFlush() {
- if(!tBatch || !tBatch->count)return;
+static uint64_t encodeFlush(bool onlyWhenIdle=false) {
+ if(!tBatch || !tBatch->count)return 0;
  EncodeThread &t=encodeThread();
  uint64_t serial,queuedUs;uint32_t tasks,depth;bool wake;
  {std::lock_guard<std::mutex> lock(t.lock);
+  if(onlyWhenIdle && t.done!=t.queued)return 0;
   tBatch->serial=serial=++t.queued;tBatch->enqueuedUs=queuedUs=nowUs();
   tasks=(uint32_t)tBatch->count;depth=(uint32_t)t.batches.size();
   wake=t.batches.empty();
@@ -2545,10 +2570,11 @@ static void encodeFlush() {
  }
  batchStage(serial,1,queuedUs,tasks,depth);
  if(wake)t.work.notify_one();
+ return serial;
 }
 // A closure takes what it uses by value (C arrays as std::array) or strongly (the objects whose handles it passes), as the call made it.
 template<class F> static void encodeLaterRaw(F &&work) {
- if(!gEncodeThread || onEncodeQueue()){work();return;}
+ if(!useEncodeThread() || onEncodeQueue()){work();return;}
  if(!tBatch) {
   EncodeThread &t=encodeThread();
   {std::lock_guard<std::mutex> lock(t.lock);if(!t.spare.empty()){tBatch=t.spare.back();t.spare.pop_back();}}
@@ -2558,7 +2584,7 @@ template<class F> static void encodeLaterRaw(F &&work) {
  if(tBatch->count>=64)encodeFlush();
 }
 static void encodeDrain() {
- if(!gEncodeThread || onEncodeQueue())return;
+ if(!useEncodeThread() || onEncodeQueue())return;
  encodeFlush();
  EncodeThread &t=encodeThread();
  std::unique_lock<std::mutex> lock(t.lock);
@@ -2583,6 +2609,18 @@ template<class F> struct TracedEncodeCall {
 };
 template<class F> static void encodeLater(F &&work,const char *label,uint32_t line,uint64_t command) {
  if(!diagOn()){encodeLaterRaw(std::forward<F>(work));return;}
+ if(panelInlineEncode()) {
+  DetailCommandScope scope(command);
+  const uint64_t began=nowUs();
+  work();
+  const uint64_t ended=nowUs();
+  if(ended-began>=250) {
+   detailDefinition((uintptr_t)label,label);
+   // An inline call has no queue or batch. Its end and duration identify its start.
+   detailPoint(++gDetailSequence,1,2,command,0,(uintptr_t)label,began,0,0,line,ended,false);
+  }
+  return;
+ }
  using Closure=std::decay_t<F>;
  encodeLaterRaw(TracedEncodeCall<Closure>{std::optional<Closure>(std::forward<F>(work)),label,line,
                 ++gDetailSequence,command,0,nowUs()});
@@ -2615,13 +2653,20 @@ static void waitForResource(id resource) {
 // Which pipeline formats draw into which pass targets (telemetry DF rows): a pass key (colour 0 format, load action, a surface, a big target)
 // with the bound pipeline's colour 0 format, counted at each pipeline bind. A state format that is not its target's is the case plain Metal
 // stores with the target's byte order (BGRA8 exchanges bytes 0 and 2).
-static std::mutex gPassFormatLock;
-static struct {uint64_t key,n;} gPassFormatRows[32];
-static unsigned gPassFormatCount;
+static struct PassFormatRow {
+ std::atomic<uint64_t> key{0},count{0};
+} gPassFormatRows[32];
 static void noteFormats(uint64_t key) {
- std::lock_guard<std::mutex> lock(gPassFormatLock);
- for(unsigned i=0;i<gPassFormatCount;i++)if(gPassFormatRows[i].key==key){gPassFormatRows[i].n++;return;}
- if(gPassFormatCount<32){gPassFormatRows[gPassFormatCount].key=key;gPassFormatRows[gPassFormatCount].n=1;gPassFormatCount++;}
+ // Bits 20 through 31 are unused, so adding one reserves zero for an empty row.
+ const uint64_t storedKey=key+1;
+ for(auto &row:gPassFormatRows) {
+  uint64_t observed=row.key.load(std::memory_order_relaxed);
+  if(!observed && row.key.compare_exchange_strong(observed,storedKey,std::memory_order_relaxed))observed=storedKey;
+  if(observed==storedKey) {
+   row.count.fetch_add(1,std::memory_order_relaxed);
+   return;
+  }
+ }
 }
 static const bool gDrawStats=access("/private/var/ngpu/debug/draw-stats",F_OK)==0;
 enum : uint32_t {kDSPipeline=1,kDSBuffer=2,kDSOffset=4,kDSBytes=8,kDSTexture=16,kDSSampler=32,kDSDepth=64,kDSViewport=128,kDSOther=256,kDSFirst=512};
@@ -2794,7 +2839,7 @@ static char encodeRenderModeOf(id object) {
 - (void)bytes:(const void *)bytes length:(NSUInteger)length index:(NSUInteger)index stage:(uint32_t)stage {
  if(dumpMaybe(_commandBuffer))[self dumpBind:[NSData dataWithBytes:bytes length:length] index:index stage:stage];
  if(gDrawStats)[self noteState:kDSBytes key:stage<<8|(uint32_t)index object:nullptr value:hashBytes(bytes,length)];
- if(!gEncodeThread){[self check:nmb_encoder_set_bytes(_handle,stage,bytes,length,(uint32_t)index) what:"setBytes"];return;}
+ if(!useEncodeThread()){[self check:nmb_encoder_set_bytes(_handle,stage,bytes,length,(uint32_t)index) what:"setBytes"];return;}
  const std::vector<uint8_t> copy((const uint8_t *)bytes,(const uint8_t *)bytes+(bytes?length:0));   // the caller's bytes are its own again
  ENCODE([self check:nmb_encoder_set_bytes(self->_handle,stage,copy.empty()?nullptr:copy.data(),length,(uint32_t)index) what:"setBytes"]);
 }
@@ -3500,7 +3545,7 @@ static char kUserDictionaryKey;
 // iPadOS 27: QuartzCore names the tasks a command buffer works for (GPU time attribution), on every buffer; there is no such accounting here.
 - (void)setResponsibleTaskIDs:(const void *)ids count:(NSUInteger)count {(void)ids;(void)count;}
 - (instancetype)init {
- if((self=[super init])){_scheduledHandlers=[NSMutableArray array];_completedHandlers=[NSMutableArray array];_surfaces=[NSMutableSet set];_resourceOwners=[NSMutableSet set];_handlers=dispatch_group_create();_schedulingHandlers=dispatch_group_create();}
+ if((self=[super init])){_scheduledHandlers=[NSMutableArray array];_completedHandlers=[NSMutableArray array];_resourceOwners=[NSMutableSet set];_handlers=dispatch_group_create();_schedulingHandlers=dispatch_group_create();}
  if(self){traceNumber=++gFrameNumber;createdUs=nowUs();createCpu=diagOn()?threadCpuUs():0;createTid=diagOn()?threadIdLow():0;earlyEligible=onRenderServerThread();if(earlyEligible){pthread_t none=nullptr;gEncodeReference.compare_exchange_strong(none,pthread_self());traceThread(1);}frontStage(traceNumber,0,1);}
  return self;
 }
@@ -3576,20 +3621,21 @@ static char kUserDictionaryKey;
 - (CFTimeInterval)kernelStartTime {return 0;}
 - (CFTimeInterval)kernelEndTime {return 0;}
 - (BOOL)commitAndWaitUntilSubmitted {[(id<MTLCommandBuffer>)self commit];[self waitUntilScheduled];return !self.failedLocally;}
+static bool isPanelFramebuffer(NBTexture *texture) {
+ return texture.surfaceFormat==0x42475241 && texture.surfaceWidth==3200 && texture.surfaceHeight==2136;
+}
 - (void)noteDpFramebufferWrite:(NBTexture *)texture {
  static const bool enabled=getenv("NATIVE_METAL_DP_SCANOUT")!=nullptr;
  static const bool panel=getenv("NATIVE_METAL_PANEL_SYNC")!=nullptr && nativeIsRenderServer();
- IOSurfaceRef surface=texture.surface;
- if(!surface)return;
- const uint32_t format=IOSurfaceGetPixelFormat(surface);
+ const uint32_t format=texture.surfaceFormat;
+ if(!format)return;
  if(enabled && format==0x62336138)writesDpFramebuffer=YES;
- if(panel && format==0x42475241 && IOSurfaceGetWidth(surface)==3200 &&
-    IOSurfaceGetHeight(surface)==2136)writesPanelFramebuffer=YES;
+ if(panel && isPanelFramebuffer(texture))writesPanelFramebuffer=YES;
  if((!diagOn() && !exactScanout()) || !nativeIsRenderServer() ||
     (format!=0x42475241 && format!=0x62336138))return;
- const uint32_t width=(uint32_t)IOSurfaceGetWidth(surface),height=(uint32_t)IOSurfaceGetHeight(surface);
+ const uint32_t width=(uint32_t)texture.surfaceWidth,height=(uint32_t)texture.surfaceHeight;
  if(width<2560 || height<1440)return;
- const uint32_t sid=IOSurfaceGetID(surface);
+ const uint32_t sid=texture.surfaceID;
  if(!sid)return;
  @synchronized(self) {
   bool recorded=false;
@@ -3602,21 +3648,24 @@ static char kUserDictionaryKey;
 }
 - (CFTimeInterval)GPUStartTime {return self.submitted && !self.failedLocally?nmb_command_buffer_gpu_time(_handle,false):0;}
 - (CFTimeInterval)GPUEndTime {return self.submitted && !self.failedLocally?nmb_command_buffer_gpu_time(_handle,true):0;}
-// An encoder whose runtime half `make` makes, on the encoding thread when that is on. A refused encoder is still an object: its calls
-// fail on the null handle and the buffer completes with an error. RenderBox caches the encoder's IMPs with methodForSelector:, and on
-// nil it called address 0 (i568: WidgetRenderer_Default crashed eight launches running, then hit its open cap and lost the device).
-- (id)encoder:(NBEncoder *)encoder make:(NmbEncoder *(^)(void))make what:(NSString *)what {
- if(self.committed){[self refuse:[what stringByAppendingString:@" after commit"]];return nil;}
+- (BOOL)prepareEncoder:(NBEncoder *)encoder what:(NSString *)what {
+ if(self.committed){[self refuse:[what stringByAppendingString:@" after commit"]];return NO;}
  encoder.commandBuffer=self;
- make=[make copy];   // the caller's block literal is on its stack; the encoding thread calls it later
- ENCODE(NmbEncoder *handle=make();
-        if(!handle)[self refuse:[NSString stringWithFormat:@"%@: %@",what,lastError()]];
-        encoder.handle=handle);
  if([encoder isKindOfClass:[NBComputeEncoder class]])_dumpKernels++;
  if(_dumpPending.count) {
   if(!_dumpTargets)_dumpTargets=[NSMutableArray array];
   [_dumpTargets addObjectsFromArray:_dumpPending];encoder.dumpEntries=_dumpPending;_dumpPending=nil;
  }
+ return YES;
+}
+// A runtime refusal still returns the frontend encoder, with a null handle.
+// RenderBox caches its IMPs and will call through a null IMP on a nil receiver.
+- (id)encoder:(NBEncoder *)encoder make:(NmbEncoder *(^)(void))make what:(NSString *)what {
+ if(![self prepareEncoder:encoder what:what])return nil;
+ make=[make copy];   // the caller's block literal is on its stack; the encoding thread calls it later
+ ENCODE(NmbEncoder *handle=make();
+        if(!handle)[self refuse:[NSString stringWithFormat:@"%@: %@",what,lastError()]];
+        encoder.handle=handle);
  return encoder;
 }
 - (id<MTLComputeCommandEncoder>)computeCommandEncoder {
@@ -3636,6 +3685,7 @@ static char kUserDictionaryKey;
  NmbRenderPassDescriptor pass={};
  std::vector<SingleSampleCopy> resolveCopies;
  _dumpPasses++;
+ const bool tracePassAttachments=diagOn() && (!panelInlineEncode() || (traceNumber&7)==0);
  if(dumpMaybe(self)) {
   if(!_dumpTargets)_dumpTargets=[NSMutableArray array];
   _dumpPending=[NSMutableArray array];
@@ -3679,7 +3729,11 @@ static char kUserDictionaryKey;
   const unsigned attachmentIndex=traceAttachment++;
   if(!a.texture)return true;
   if(![(id)a.texture isKindOfClass:[NBTexture class]])return false;
-  NBTexture *texture=(NBTexture *)a.texture;if(texture.surface)[_surfaces addObject:texture];
+  NBTexture *texture=(NBTexture *)a.texture;
+  if(texture.surface) {
+   if(!_surfaces)_surfaces=[NSMutableSet set];
+   [_surfaces addObject:texture];
+  }
   [self noteDpFramebufferWrite:texture];
   [self own:texture];
   const size_t copiesBefore=resolveCopies.size();
@@ -3687,7 +3741,11 @@ static char kUserDictionaryKey;
   if(a.resolveTexture) {
    if(![(id)a.resolveTexture isKindOfClass:[NBTexture class]])return false;
    NBTexture *resolve=(NBTexture *)a.resolveTexture;
-   [self own:resolve];if(resolve.surface)[_surfaces addObject:resolve];
+   [self own:resolve];
+   if(resolve.surface) {
+    if(!_surfaces)_surfaces=[NSMutableSet set];
+    [_surfaces addObject:resolve];
+   }
    [self noteDpFramebufferWrite:resolve];
    const bool resolves=a.storeAction==MTLStoreActionMultisampleResolve || a.storeAction==MTLStoreActionStoreAndMultisampleResolve;
    if(singleSample()) {
@@ -3710,11 +3768,12 @@ static char kUserDictionaryKey;
     out.resolve_slice=a.resolveSlice;out.resolve_depth_plane=a.resolveDepthPlane;
    }
   }
-  if(diagOn()) {
+  // Keep every display surface and special attachment. Sample simple intermediate color attachments.
+  if(tracePassAttachments || (diagOn() && (texture.surface || a.resolveTexture || attachmentIndex>=8 || out.load==MTLLoadActionClear))) {
    TraceRec rec{};rec.type=16;rec.t0=nowUs();rec.t1=traceNumber;rec.t2=(uintptr_t)out.texture;rec.t3=(uintptr_t)out.resolve_texture;
    rec.a=_dumpPasses;rec.b=attachmentIndex;rec.c=(uint32_t)out.load|((uint32_t)out.store<<8)|((uint32_t)texture.descriptor.samples<<16);
-   rec.d=(uint32_t)a.texture.pixelFormat;rec.tid=(uint32_t)texture.width;rec.cpu0=texture.height;
-   rec.cpu1=texture.surface?IOSurfaceGetID(texture.surface):0;rec.tid2=(uint32_t)a.texture.sampleCount;tracePush(rec);
+   rec.d=(uint32_t)texture.pixelFormat;rec.tid=(uint32_t)texture.width;rec.cpu0=texture.height;
+   rec.cpu1=texture.surfaceID;rec.tid2=(uint32_t)texture.sampleCount;tracePush(rec);
   }
   if(freezeWallpaperOn() && attachmentIndex<8) {
    auto output=[&](NBTexture *written) {
@@ -3773,7 +3832,28 @@ static char kUserDictionaryKey;
    tracePush(rec);
   }
  }
- id<MTLRenderCommandEncoder> made=[self encoder:encoder make:^{return nmb_render_encoder_new(handle,&pass);} what:@"renderCommandEncoder"];
+ static const bool earlyPanelEncode=getenv("NATIVE_METAL_PANEL_ENCODE_EARLY")!=nullptr;
+ const bool firstPanelPass=earlyPanelEncode && useEncodeThread() && !onEncodeQueue() && !triedEarlyPanelEncode && writesPanelFramebuffer &&
+     isPanelFramebuffer((NBTexture *)d.colorAttachments[0].texture);
+ if(![self prepareEncoder:encoder what:@"renderCommandEncoder"])return nil;
+ // Put the owned pass descriptor straight in the encoding batch. A copied
+ // Objective-C block would allocate a second copy and be freed by the worker.
+ ENCODE(if(firstPanelPass)frontStage(traceNumber,0,15);
+        NmbEncoder *runtimeEncoder=nmb_render_encoder_new(handle,&pass);
+        if(firstPanelPass)frontStage(traceNumber,0,16);
+        if(!runtimeEncoder)[self refuse:[NSString stringWithFormat:@"renderCommandEncoder: %@",lastError()]];
+        encoder.handle=runtimeEncoder);
+ id<MTLRenderCommandEncoder> made=(id<MTLRenderCommandEncoder>)encoder;
+ // Split only the first panel pass and only when the worker can start on it
+ // without adding to a backlog. Otherwise retain the normal batch boundary.
+ if(made && firstPanelPass) {
+  triedEarlyPanelEncode=YES;
+  const uint64_t batch=encodeFlush(true);
+  if(diagOn()) {
+   TraceRec rec{};rec.type=15;rec.t0=nowUs();rec.t1=traceNumber;rec.t3=batch;
+   rec.a=17;rec.b=threadIdLow();tracePush(rec);
+  }
+ }
  if(made) {
   ((NBRenderEncoder *)made).resolveCopies=std::move(resolveCopies);
   id<MTLTexture> t0=d.colorAttachments[0].texture;
@@ -6212,8 +6292,16 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
  {
   // The five most used (pass target, pipeline) format pairs: p target format, s pipeline format, l load action, S an IOSurface, B a screen-size target.
   struct {uint64_t key,n;} top[5]={};
-  {std::lock_guard<std::mutex> lock(gPassFormatLock);
-   for(unsigned i=0;i<gPassFormatCount;i++)for(unsigned t=0;t<5;t++)if(gPassFormatRows[i].n>top[t].n){for(unsigned u=4;u>t;u--)top[u]=top[u-1];top[t]={gPassFormatRows[i].key,gPassFormatRows[i].n};break;}}
+  for(const auto &entry:gPassFormatRows) {
+   const uint64_t key=entry.key.load(std::memory_order_relaxed);
+   if(!key)break;
+   const uint64_t count=entry.count.load(std::memory_order_relaxed);
+   for(unsigned t=0;t<5;t++)if(count>top[t].n) {
+    for(unsigned u=4;u>t;u--)top[u]=top[u-1];
+    top[t]={key-1,count};
+    break;
+   }
+  }
   for(unsigned t=0;t<5 && top[t].n;t++)
    row("DF p%u s%u l%u %s%s n%llu",(unsigned)(top[t].key&0xffff),(unsigned)(top[t].key>>32),(unsigned)(top[t].key>>16&3),top[t].key>>18&1?"S":"-",
     top[t].key>>19&1?"B":"-",(ull)top[t].n);
