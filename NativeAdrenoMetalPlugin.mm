@@ -130,22 +130,6 @@ static bool bootArgSet(const char *key) {
     const size_t length = strlen(key);
     return at && (at[length] == 0 || at[length] == ' ');
 }
-#if !TARGET_OS_OSX && defined(__arm64e__)
-static bool setQuartzCoreDebugOption(const char *key) {
-    const auto setOption = reinterpret_cast<void (*)(unsigned, bool)>(dlsym(RTLD_DEFAULT, "CASetDebugOption"));
-    const auto getOption = reinterpret_cast<bool (*)(unsigned)>(dlsym(RTLD_DEFAULT, "CAGetDebugOption"));
-    const auto optionName = reinterpret_cast<const char *(*)(unsigned)>(dlsym(RTLD_DEFAULT, "CAGetDebugOptionEnvVariableName"));
-    if (!setOption || !getOption || !optionName) return false;
-    for (unsigned i = 0; i < 1024; ++i) {
-        const char *name = optionName(i);
-        if (!name) break;
-        if (strcmp(name, key)) continue;
-        setOption(i, true);
-        return getOption(i);
-    }
-    return false;
-}
-#endif
 // `site` is the slid address of that branch in the running QuartzCore; any other word there is left alone (0x6E41).
 [[maybe_unused]] static unsigned patchFramebufferBranch(uintptr_t site) {
     uint32_t word = 0;
@@ -395,6 +379,14 @@ static id deviceForPort(unsigned port) {
         }
         if (bootArgSet("gpu-trace=1")) setenv("SHENG_GPU_TRACE", "1", 1);
         else unsetenv("SHENG_GPU_TRACE");
+#if TARGET_OS_IPHONE && defined(__arm64e__)
+        if (!strcmp(getprogname(), "backboardd") && (bootArgSet("panel-sync=1") || bootArgSet("panel-sync=2")))
+            setenv("NATIVE_METAL_PANEL_SYNC", "1", 1);
+        else unsetenv("NATIVE_METAL_PANEL_SYNC");
+        if (!strcmp(getprogname(), "backboardd") && bootArgSet("panel-sync=2"))
+            setenv("NATIVE_METAL_EXACT_SCANOUT", "1", 1);
+        else unsetenv("NATIVE_METAL_EXACT_SCANOUT");
+#endif
         // The bridge's work placement (metal-flow=<bits>, read below). Any value logs the FL counts
         // (native_bridge_metal_open), so two runs compare without diag=1's own cost.
         // gpu-purge=0: the bridge discards nothing of what callers declare Volatile (NativeMetalPurge.rs), for a comparison on the
@@ -547,16 +539,10 @@ static id deviceForPort(unsigned port) {
             const uint8_t off = 0;
             gpu->mark(writeTask(0x1e702116c + 156 + slide, &off, sizeof off) ? 0x6E03 : 0x6EF3);
             if (!strcmp(getprogname(), "backboardd") && bootArgSet("fb-bgra=1")) gpu->mark(patchFramebufferBranch(0x184461928 + slide));
-            if (!strcmp(getprogname(), "backboardd") && bootArgSet("uke-dp-desktop=1")) {
+            // XR10 writers still wait for their last batch to reach the kernel
+            // before Scheduled. QuartzCore manages damage for each display.
+            if (!strcmp(getprogname(), "backboardd") && bootArgSet("uke-dp-desktop=1"))
                 setenv("NATIVE_METAL_DP_SCANOUT", "1", 1);
-                // A new or reconnected DP desktop must paint the whole update
-                // and populate each rotating XR10 surface. FullFrameRequired
-                // describes scanout geometry; QuartzCore builds damage separately.
-                const bool fullBounds = setQuartzCoreDebugOption("CA_DISABLE_DIRTY_REGIONS");
-                const bool fullLayers = setQuartzCoreDebugOption("CA_DISABLE_SOFT_DIRTY_REGION");
-                os_log(OS_LOG_DEFAULT, "NativeAdrenoMetal: DP whole-frame damage bounds=%{public}d software=%{public}d",
-                       int(fullBounds), int(fullLayers));
-            }
             // What framebuffer_pixel_format reads in the render server, once the desktop has started (other processes draw no
             // framebuffer): 0x6E20 | 1 headroom override 1, 2 threshold above 1, 4 CA_FORCE_FP16_FRAMEBUFFER (_ca_debug_options
             // 0x1e702116c + 128), 8 CA_ALLOW_EDR_MIRRORING (+ 156), 0x10 the device-is-virtualized byte (0x1e701bdd9).

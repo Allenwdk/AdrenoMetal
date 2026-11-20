@@ -3918,3 +3918,7 @@ pub extern "C" fn nmb_command_buffer_diagnostic_id(buffer: *const NmbCommandBuff
 pub extern "C" fn nmb_gpu_diagnostic_hook(hook: extern "C" fn(u32,u64,u64,u64)) {
     metal2vulkan_runtime::stage_trace::set_diagnostic_hook(hook);
 }
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_set_native_submit_cursor(cursor: extern "C" fn() -> u64) {
+    metal2vulkan_runtime::stage_trace::set_native_submit_cursor(cursor);
+}

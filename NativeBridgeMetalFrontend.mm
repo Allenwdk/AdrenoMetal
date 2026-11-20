@@ -54,6 +54,7 @@
 #include "NativeBridgeMetalFrontend.h"
 #include "NativeGpuTrace.h"
 #include "NativeGpuLatency.h"
+#include "NativeScanoutWriters.h"
 
 extern "C" void sys_dcache_flush(void *start, size_t length);
 
@@ -74,12 +75,22 @@ struct ScopedRenderMode {
  ~ScopedRenderMode(){if(active){gSetRenderMode(previous);tRenderMode=previous;}}
 };
 static bool (*gFrameTransport)(uint32_t,const void *,uint32_t);
+static NativeScanoutWriters gScanoutWriters;
+static std::mutex gScanoutWriterLock;
+static bool exactScanout() {
+ static const bool enabled=nativeIsRenderServer() && getenv("NATIVE_METAL_EXACT_SCANOUT");
+ return enabled;
+}
 static std::atomic<uint64_t> gFrameNumber{0};
 // The kernel trace (gpu-trace=1) takes only the identities of the render, encode and completion threads, which the kernel's
 // CPU sampler follows. Everything else of this process goes to the frame trace file.
 static bool gpuTraceOn(){static const bool on=getenv("SHENG_GPU_TRACE")!=nullptr;return on;}
 static void traceRuntimeWide(uint64_t,uint32_t,uint32_t);
-static void frameRuntime(uint32_t event,uint64_t id,uint64_t a,uint64_t b){if(event==39 && a>=40 && native_gpu_latency_stage((uint32_t)a))traceRuntimeWide(id,(uint32_t)a,(uint32_t)b);}
+static void traceNativeSubmit(uint64_t command,uint32_t fence,uint32_t sequence);
+static void frameRuntime(uint32_t event,uint64_t id,uint64_t a,uint64_t b){
+ if(event==39 && a>=40 && native_gpu_latency_stage((uint32_t)a))traceRuntimeWide(id,(uint32_t)a,(uint32_t)b);
+ else if(event==46)traceNativeSubmit(id,(uint32_t)a,(uint32_t)b);
+}
 
 // DEBUG (the guest's memory corruption, 2026-10-26): with NATIVE_METAL_ABORT_PROBE=1 in its environment, a process that aborts
 // (a __stack_chk_fail among them) or faults (SIGSEGV, SIGBUS) first writes to its standard error whether the stack guard changed
@@ -259,6 +270,13 @@ static void tracePush(const TraceRec &rec) {
 // handle halves directly from its full-width diagnostic hook in the file.
 static void traceRuntimeWide(uint64_t id,uint32_t stage,uint32_t argument) {
  TraceRec rec{};rec.type=22;rec.t0=nowUs();rec.t1=id;rec.a=stage;rec.b=argument;tracePush(rec);
+}
+static void traceNativeSubmit(uint64_t command,uint32_t fence,uint32_t sequence) {
+ if(exactScanout()) {
+  std::lock_guard<std::mutex> lock(gScanoutWriterLock);
+  gScanoutWriters.issued(command,fence);
+ }
+ TraceRec rec{};rec.type=28;rec.t0=nowUs();rec.t1=command;rec.a=fence;rec.b=sequence;rec.tid=threadIdLow();tracePush(rec);
 }
 static thread_local uint64_t tEncodeBatchId;
 static void traceThread(uint32_t role) {
@@ -2243,6 +2261,11 @@ static void dumpSurfacesOnce(NSSet *textures,NSSet *owners) {
  uint32_t createCpu,createTid,commitCpu,commitTid;
  BOOL earlyEligible;   // made by the render server's thread: its completed handlers may run at submission (see fireEarly)
  BOOL writesDpFramebuffer;
+ BOOL writesPanelFramebuffer;
+ BOOL ambiguousScanoutWrites;
+ uint64_t scanoutRuntime;
+ struct ScanoutTraceSurface {uint32_t id=0,format=0,width=0,height=0;};
+ std::array<ScanoutTraceSurface,4> scanoutTraceSurfaces;
  std::vector<WatchedSource> watched;
 }
 @property(nonatomic) NmbCommandBuffer *handle;
@@ -2749,6 +2772,8 @@ static char encodeRenderModeOf(id object) {
   if(_commandBuffer.dumpTargets.count>before)[_dumpEntries addObject:_commandBuffer.dumpTargets.lastObject];
  }
  if(texture){[_commandBuffer own:texture];}
+ if(texture && (texture.usage&MTLTextureUsageShaderWrite))
+  [_commandBuffer noteDpFramebufferWrite:(NBTexture *)texture];
  [self dumpBind:texture index:index stage:stage+4];
  if(texture && [(NBTexture *)texture surface])[_commandBuffer.surfaces addObject:texture];
  if(texture && gWatchSources)[_commandBuffer watchTexture:(NBTexture *)texture];
@@ -3479,7 +3504,14 @@ static char kUserDictionaryKey;
  if(self){traceNumber=++gFrameNumber;createdUs=nowUs();createCpu=diagOn()?threadCpuUs():0;createTid=diagOn()?threadIdLow():0;earlyEligible=onRenderServerThread();if(earlyEligible){pthread_t none=nullptr;gEncodeReference.compare_exchange_strong(none,pthread_self());traceThread(1);}frontStage(traceNumber,0,1);}
  return self;
 }
-- (void)dealloc {DetailSpan timing(17,(uintptr_t)_handle);[self disown];nmb_command_buffer_release(_handle);}
+- (void)dealloc {
+ DetailSpan timing(17,(uintptr_t)_handle);
+ if(scanoutRuntime) {
+  std::lock_guard<std::mutex> lock(gScanoutWriterLock);
+  gScanoutWriters.end(scanoutRuntime,traceNumber);
+ }
+ [self disown];nmb_command_buffer_release(_handle);
+}
 - (void)own:(id)resource {
  const NSUInteger before=_resourceOwners.count;
  [_resourceOwners addObject:resource];
@@ -3546,9 +3578,27 @@ static char kUserDictionaryKey;
 - (BOOL)commitAndWaitUntilSubmitted {[(id<MTLCommandBuffer>)self commit];[self waitUntilScheduled];return !self.failedLocally;}
 - (void)noteDpFramebufferWrite:(NBTexture *)texture {
  static const bool enabled=getenv("NATIVE_METAL_DP_SCANOUT")!=nullptr;
+ static const bool panel=getenv("NATIVE_METAL_PANEL_SYNC")!=nullptr && nativeIsRenderServer();
  IOSurfaceRef surface=texture.surface;
- if(enabled && surface && IOSurfaceGetPixelFormat(surface)==0x62336138)
-  writesDpFramebuffer=YES;
+ if(!surface)return;
+ const uint32_t format=IOSurfaceGetPixelFormat(surface);
+ if(enabled && format==0x62336138)writesDpFramebuffer=YES;
+ if(panel && format==0x42475241 && IOSurfaceGetWidth(surface)==3200 &&
+    IOSurfaceGetHeight(surface)==2136)writesPanelFramebuffer=YES;
+ if((!diagOn() && !exactScanout()) || !nativeIsRenderServer() ||
+    (format!=0x42475241 && format!=0x62336138))return;
+ const uint32_t width=(uint32_t)IOSurfaceGetWidth(surface),height=(uint32_t)IOSurfaceGetHeight(surface);
+ if(width<2560 || height<1440)return;
+ const uint32_t sid=IOSurfaceGetID(surface);
+ if(!sid)return;
+ @synchronized(self) {
+  bool recorded=false;
+  for(auto &entry:scanoutTraceSurfaces) {
+   if(entry.id==sid){recorded=true;break;}
+   if(!entry.id){entry={sid,format,width,height};recorded=true;break;}
+  }
+  if(!recorded)ambiguousScanoutWrites=YES;
+ }
 }
 - (CFTimeInterval)GPUStartTime {return self.submitted && !self.failedLocally?nmb_command_buffer_gpu_time(_handle,false):0;}
 - (CFTimeInterval)GPUEndTime {return self.submitted && !self.failedLocally?nmb_command_buffer_gpu_time(_handle,true):0;}
@@ -3783,6 +3833,10 @@ static char kUserDictionaryKey;
 // After completion (or a refusal): invalidate the CPU's view of imported surfaces, then completed handlers, once.
 - (void)finish {
  DetailCommandScope commandScope(traceNumber);
+ if(scanoutRuntime) {
+  std::lock_guard<std::mutex> lock(gScanoutWriterLock);
+  gScanoutWriters.end(scanoutRuntime,traceNumber);
+ }
  traceThread(3);
  frontStage(traceNumber,self.commitIndex,8);
  const uint64_t flushed=flushSurfaces(_surfaces);
@@ -3884,10 +3938,11 @@ static char kUserDictionaryKey;
   }
   ++gWallpaperAllowed;
  }
- // The external framebuffer snapshots the Adreno fence after QuartzCore's
- // submitted callback. Keep its XR10 writes out of deferred submission.
- if(writesDpFramebuffer && !self.encodeFailure && !nmb_command_buffer_require_kernel_submission(_handle))
-  [self refuse:[@"native DP framebuffer submission: " stringByAppendingString:lastError()]];
+ // QuartzCore can hand the surface to direct scanout as soon as Scheduled
+ // is observed. Its last writer batch must already have reached the driver.
+ if((writesDpFramebuffer || writesPanelFramebuffer) && !self.encodeFailure &&
+    !nmb_command_buffer_require_kernel_submission(_handle))
+  [self refuse:[@"native scanout framebuffer submission: " stringByAppendingString:lastError()]];
  if(!self.encodeFailure) {
   frontStage(traceNumber,self.commitIndex,4);
   const uint64_t flushed=flushSurfaces(_surfaces);
@@ -3901,6 +3956,23 @@ static char kUserDictionaryKey;
   const bool capture=appIndex && range.first && appIndex>=range.first && appIndex<(uint64_t)range.first+range.second;
   if(capture && dumpAtPassEnd()){self.dumpAppIndex=appIndex;dumpReadback(self,appIndex);}
   frontStage(traceNumber,self.commitIndex,6);
+  if((diagOn() || exactScanout()) && nativeIsRenderServer()) {
+   const uint64_t runtime=nmb_command_buffer_diagnostic_id(_handle);
+   if(runtime)@synchronized(self) {
+    if(exactScanout() && scanoutTraceSurfaces[0].id) {
+     scanoutRuntime=runtime;
+     std::lock_guard<std::mutex> lock(gScanoutWriterLock);
+     gScanoutWriters.begin(runtime,traceNumber,scanoutTraceSurfaces[0].id,
+                          ambiguousScanoutWrites || scanoutTraceSurfaces[1].id ||
+                          !(writesPanelFramebuffer || writesDpFramebuffer));
+    }
+    for(const auto &surface:scanoutTraceSurfaces)if(surface.id) {
+     TraceRec rec{};rec.type=27;rec.t0=nowUs();rec.t1=runtime;rec.t2=traceNumber;
+     rec.a=surface.id;rec.b=surface.format;rec.c=surface.width;rec.d=surface.height;
+     rec.tid=threadIdLow();tracePush(rec);
+    }
+   }
+  }
   if(nmb_command_buffer_on_completed(_handle,completed,context) &&
      nmb_command_buffer_on_scheduled(_handle,scheduled,context) && nmb_command_buffer_commit(_handle)) {
    frontStage(traceNumber,self.commitIndex,7);
@@ -3943,19 +4015,45 @@ static char kUserDictionaryKey;
  gTimeWaitCompleted.add(began);
 }
 - (void)waitUntilScheduled {
- if(!self.committed)return;
+ if(!self.committed) {
+  if(exactScanout() && gFrameTransport) {
+   NativeGpuTraceRecord claim{};claim.event=GpuTraceScanoutHandoff;
+   (void)gFrameTransport(NativeGpuTraceMethod,&claim,sizeof claim);
+  }
+  return;
+ }
  encodeDrain();
  const uint64_t began=nowUs();
- if(!self.failedLocally && !nmb_command_buffer_wait_scheduled(_handle)){
+ const bool scheduled=!self.failedLocally && nmb_command_buffer_wait_scheduled(_handle);
+ if(!self.failedLocally && !scheduled){
+  if(exactScanout() && gFrameTransport) {
+   NativeGpuTraceRecord claim{};claim.event=GpuTraceScanoutHandoff;
+   (void)gFrameTransport(NativeGpuTraceMethod,&claim,sizeof claim);
+  }
   NBLOG(@"native-metal: waitUntilScheduled refused: %@",lastError());return;
  }
  const uint32_t cpuStart=threadCpuUs();
  dispatch_group_wait(_schedulingHandlers,DISPATCH_TIME_FOREVER);
  {
   TraceRec rec={};rec.type=3;rec.t0=began;rec.t1=nowUs();rec.tid=threadIdLow();rec.a=(uint32_t)(uintptr_t)__builtin_return_address(0);
+  if(traceWanted() && !self.failedLocally) {
+   rec.t2=traceNumber;rec.t3=nmb_command_buffer_diagnostic_id(_handle);
+  }
   rec.cpu0=cpuStart;rec.cpu1=threadCpuUs();traceNote(rec.tid);tracePush(rec);
  }
  gTimeWaitScheduled.add(began);
+ if(exactScanout() && gFrameTransport) {
+  NativeGpuTraceRecord claim{};claim.event=GpuTraceScanoutHandoff;
+  if(scheduled && scanoutRuntime) {
+   std::lock_guard<std::mutex> lock(gScanoutWriterLock);
+   const auto &surface=scanoutTraceSurfaces[0];
+   if(const uint32_t fence=gScanoutWriters.fence(scanoutRuntime,traceNumber,surface.id)) {
+    claim.value[0]=surface.id;claim.value[1]=traceNumber;claim.value[2]=fence;
+    claim.value[3]=surface.format;claim.value[4]=surface.width;claim.value[5]=surface.height;
+   }
+  }
+  (void)gFrameTransport(NativeGpuTraceMethod,&claim,sizeof claim);
+ }
 }
 @end
 // The scanout client: before it copies an offered frame, the GPU work committed up to then must be done.
@@ -5556,6 +5654,9 @@ extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint
  gMissing=missing;gInFlight=[NSMutableSet set];
  if(cache && *cache){configureShaderDiskCache(cache);gCacheRoot=cache;}
  if(diagOn())nmb_message_hook(runtimeMessage);
+#if TARGET_OS_OSX
+ // iPadOS render services can be terminated for dup2 under their sandbox.
+ // Their runtime message hook and frame recorder use their own output paths.
  const bool renderStderr=diagOn() && nativeIsRenderServer();
  if(diagOn() && !gCacheRoot.empty() && (renderStderr || (getenv("NATIVE_METAL_DUMP_CB") && !strcmp(getprogname(),"iconservicesagent")))) {
   const std::string path=gCacheRoot+"/runtime-stderr.log";
@@ -5565,6 +5666,7 @@ extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint
    if(fd!=STDERR_FILENO){dup2(fd,STDERR_FILENO);close(fd);}
   }
  }
+#endif
  gDevice=nmb_device_open(loader,cache);
  if(loader)gLoaderPath=loader;
  if(gDevice && loader && !strcmp(getprogname(),"backboardd") && (getenv("NATIVE_METAL_TRANSIENT_GMEM") || getenv("NATIVE_METAL_TRANSIENT_SYSMEM_AB"))) {
@@ -5575,11 +5677,18 @@ extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint
    dlclose(library);
   }
  }
- if(gpuTraceOn() && loader) {
+ if((gpuTraceOn() || exactScanout()) && loader) {
   if(void *library=dlopen(loader,RTLD_NOW|RTLD_NOLOAD))
    gFrameTransport=(bool (*)(uint32_t,const void *,uint32_t))dlsym(library,"tu_darwin_frame_diagnostic");
  }
- if(diagOn() && loader)nmb_gpu_diagnostic_hook(frameRuntime);
+ if((diagOn() || exactScanout()) && loader) {
+  nmb_gpu_diagnostic_hook(frameRuntime);
+  if(nativeIsRenderServer())if(void *library=dlopen(loader,RTLD_NOW|RTLD_NOLOAD)) {
+   using Cursor=uint64_t (*)(void);
+   if(auto cursor=(Cursor)dlsym(library,"tu_darwin_submit_cursor"))nmb_set_native_submit_cursor(cursor);
+   dlclose(library);
+  }
+ }
  if(!gDevice){NBLOG(@"native-metal: device refused: %s",nmb_last_error());return nil;}
  watchImportPressure();
  logFlowCounts();

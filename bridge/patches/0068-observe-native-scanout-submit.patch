@@ -1,0 +1,51 @@
+diff --git a/crates/metal2vulkan-runtime/src/stage_trace.rs b/crates/metal2vulkan-runtime/src/stage_trace.rs
+--- a/crates/metal2vulkan-runtime/src/stage_trace.rs
++++ b/crates/metal2vulkan-runtime/src/stage_trace.rs
+@@ -244,3 +244,29 @@
+         hook(45, id, command, batch);
+     }
+ }
++
++type NativeSubmitCursor = extern "C" fn() -> u64;
++static NATIVE_SUBMIT_CURSOR: std::sync::OnceLock<NativeSubmitCursor> = std::sync::OnceLock::new();
++
++/// Read the driver thread's current native submission sequence and fence.
++/// The observer is optional and may only be installed for this process's driver.
++pub fn set_native_submit_cursor(cursor: NativeSubmitCursor) {
++    let _ = NATIVE_SUBMIT_CURSOR.set(cursor);
++}
++
++pub(crate) fn native_submit_cursor() -> u64 {
++    NATIVE_SUBMIT_CURSOR.get().map_or(0, |cursor| cursor())
++}
++
++/// Both samples straddle the synchronous Vulkan call on the same thread.
++/// A queued or empty submission returning without a new fence stays unknown.
++pub(crate) fn diagnostic_native_submit(id: u64, before: u64) {
++    let after = native_submit_cursor();
++    let sequence = after >> 32;
++    let fence = after as u32;
++    if sequence != 0 && sequence != before >> 32 && fence != 0 {
++        if let Some(hook) = DIAGNOSTIC_HOOK.get() {
++            hook(46, id, u64::from(fence), sequence);
++        }
++    }
++}
+diff --git a/crates/metal2vulkan-runtime/src/command_buffer/submit.rs b/crates/metal2vulkan-runtime/src/command_buffer/submit.rs
+--- a/crates/metal2vulkan-runtime/src/command_buffer/submit.rs
++++ b/crates/metal2vulkan-runtime/src/command_buffer/submit.rs
+@@ -1559,10 +1559,14 @@
+                 relayed: &self.relayed,
+                 carry: &carry,
+             };
++            let cursor = last.then(crate::stage_trace::native_submit_cursor);
+             let submitted =
+                 scheduler
+                     .group
+                     .submit(device, &mut scheduler.waited[queue], Some(after));
++            if let (Some(before), Ok(_)) = (cursor, &submitted) {
++                crate::stage_trace::diagnostic_native_submit(Arc::as_ptr(self) as u64, before);
++            }
+             // A watched submission held its thread long before the call: its line
+             // (`slow_submissions.rs`).
+             if let (Some(watch), Ok(at)) = (watch.take(), &submitted) {

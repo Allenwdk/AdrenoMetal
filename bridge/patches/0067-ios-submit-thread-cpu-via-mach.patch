@@ -1,0 +1,44 @@
+diff --git a/crates/metal2vulkan-runtime/src/device/submit_stalls.rs b/crates/metal2vulkan-runtime/src/device/submit_stalls.rs
+--- a/crates/metal2vulkan-runtime/src/device/submit_stalls.rs
++++ b/crates/metal2vulkan-runtime/src/device/submit_stalls.rs
+@@ -257,11 +257,36 @@
+     }
+ }
+ 
+-/// The calling thread's CPU time, in nanoseconds (`CLOCK_THREAD_CPUTIME_ID`; on Windows its
+-/// kernel and user times, `GetThreadTimes`, in 100 ns units, which the system charges at its
+-/// clock's ticks); `None` where it cannot be read.
++/// The calling thread's CPU time, in nanoseconds. iOS uses Mach thread accounting,
++/// other Unix targets use CLOCK_THREAD_CPUTIME_ID, and Windows uses GetThreadTimes.
+ pub(crate) fn thread_cpu() -> Option<u64> {
+-    #[cfg(unix)]
++    #[cfg(target_os = "ios")]
++    {
++        let mut info = std::mem::MaybeUninit::<libc::thread_basic_info_data_t>::uninit();
++        let mut count = libc::THREAD_BASIC_INFO_COUNT;
++        // SAFETY: pthread_mach_thread_np borrows the current thread's port. The
++        // buffer has room for the THREAD_BASIC_INFO reply in Mach integer units.
++        let status = unsafe {
++            libc::thread_info(
++                libc::pthread_mach_thread_np(libc::pthread_self()),
++                libc::THREAD_BASIC_INFO as libc::thread_flavor_t,
++                info.as_mut_ptr().cast(),
++                &mut count,
++            )
++        };
++        if status != libc::KERN_SUCCESS || count != libc::THREAD_BASIC_INFO_COUNT {
++            return None;
++        }
++        // SAFETY: Mach returned a complete THREAD_BASIC_INFO reply.
++        let info = unsafe { info.assume_init() };
++        let nanos = |time: libc::time_value_t| {
++            let seconds = u64::try_from(time.seconds).ok()?;
++            let micros = u64::try_from(time.microseconds).ok()?;
++            Some(seconds * 1_000_000_000 + micros * 1_000)
++        };
++        Some(nanos(info.user_time)? + nanos(info.system_time)?)
++    }
++    #[cfg(all(unix, not(target_os = "ios")))]
+     {
+         let mut now = libc::timespec {
+             tv_sec: 0,
