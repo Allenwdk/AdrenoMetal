@@ -279,6 +279,7 @@ pub unsafe extern "C" fn nmb_device_open(loader: *const c_char, cache: *const c_
         // Render imported surfaces and padded buffers directly under the board policy.
         options.policy.host_page_textures = metal2vulkan::device::HostPageTexturePolicy::InPlaceWrites;
         options.policy.pipeline_waits = metal2vulkan::device::PipelineWaitPolicy::Exact;
+        options.policy.completion = metal2vulkan::device::CompletionPolicy::Exact;
         // Render encoder calls are checked at the call and lowered on the device's lowering thread, so the program's thread does not
         // pay for them (the render server's main thread spent most of the plugin's CPU time lowering). A refusal only the lowering
         // finds fails the command buffer, naming the call. `metal-flow=` without bit 1 keeps the lowering at the call.
